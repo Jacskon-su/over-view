@@ -192,17 +192,36 @@ def get_stock_info_map():
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_history_data(symbol, start_date=None, end_date=None, period="2y"):
-    """下載數據 (快取)"""
-    try:
-        ticker = yf.Ticker(symbol)
-        if start_date and end_date:
-            df = ticker.history(start=start_date, end=end_date)
-        else:
-            df = ticker.history(period=period)
-        if df.empty: return None
-        if df.index.tz is not None: df.index = df.index.tz_localize(None)
-        return df
-    except: return None
+    """下載數據 (快取) - 加入重試機制與隨機延遲以避免被擋"""
+    retries = 3
+    for attempt in range(retries):
+        try:
+            # 加入隨機延遲，分散請求壓力 (Rate Limiting 防護)
+            time.sleep(random.uniform(0.1, 0.5))
+            
+            ticker = yf.Ticker(symbol)
+            if start_date and end_date:
+                df = ticker.history(start=start_date, end=end_date)
+            else:
+                df = ticker.history(period=period)
+            
+            if df.empty: 
+                # 若無資料，暫停一下再重試，避免是網路瞬斷
+                if attempt < retries - 1:
+                    time.sleep(1)
+                    continue
+                return None
+
+            if df.index.tz is not None: df.index = df.index.tz_localize(None)
+            return df
+            
+        except Exception as e:
+            # 發生錯誤時 (如連線被拒)，進行指數退避 (等待時間變長)
+            if attempt < retries - 1:
+                time.sleep(2 * (attempt + 1))
+                continue
+            return None
+    return None
 
 def get_stock_data_with_realtime(code, symbol, analysis_date_str):
     """取得資料並補即時盤"""
