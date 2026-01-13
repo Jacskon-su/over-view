@@ -190,41 +190,21 @@ def get_stock_info_map():
     except:
         return {}
 
+# 🟢 舊版函式 (保留給個股診斷用)
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_history_data(symbol, start_date=None, end_date=None, period="2y"):
-    """下載數據 (快取) - 加入重試機制與隨機延遲以避免被擋"""
-    retries = 3
-    for attempt in range(retries):
-        try:
-            # 加入隨機延遲，分散請求壓力 (Rate Limiting 防護)
-            time.sleep(random.uniform(0.1, 0.5))
-            
-            ticker = yf.Ticker(symbol)
-            if start_date and end_date:
-                df = ticker.history(start=start_date, end=end_date)
-            else:
-                df = ticker.history(period=period)
-            
-            if df.empty: 
-                # 若無資料，暫停一下再重試，避免是網路瞬斷
-                if attempt < retries - 1:
-                    time.sleep(1)
-                    continue
-                return None
-
-            if df.index.tz is not None: df.index = df.index.tz_localize(None)
-            return df
-            
-        except Exception as e:
-            # 發生錯誤時 (如連線被拒)，進行指數退避 (等待時間變長)
-            if attempt < retries - 1:
-                time.sleep(2 * (attempt + 1))
-                continue
-            return None
-    return None
+    try:
+        ticker = yf.Ticker(symbol)
+        if start_date and end_date:
+            df = ticker.history(start=start_date, end=end_date)
+        else:
+            df = ticker.history(period=period)
+        if df.empty: return None
+        if df.index.tz is not None: df.index = df.index.tz_localize(None)
+        return df
+    except: return None
 
 def get_stock_data_with_realtime(code, symbol, analysis_date_str):
-    """取得資料並補即時盤"""
     df = fetch_history_data(symbol)
     if df is None or df.empty: return None
     
@@ -246,13 +226,128 @@ def get_stock_data_with_realtime(code, symbol, analysis_date_str):
     return df
 
 # ==========================================
-# 🧠 綜合分析引擎 (含錯誤回報機制)
+# 🚀 批量下載加速模組 (New Batch Engine)
 # ==========================================
-def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sector_db):
+def fetch_data_batch(stock_map, period="1y", chunk_size=100):
+    """
+    批量下載歷史資料 (加速核心)
+    """
+    # 準備下載清單
+    all_codes = list(stock_map.keys())
+    all_symbols = [info['symbol'] for info in stock_map.values()]
+    data_store = {}
+    
+    # 建立反向對照表 (Symbol -> Code)
+    symbol_to_code = {v['symbol']: k for k, v in stock_map.items()}
+
+    # 分批處理
+    total_chunks = (len(all_symbols) // chunk_size) + 1
+    progress_text = st.empty()
+    bar = st.progress(0)
+    
+    for i in range(0, len(all_symbols), chunk_size):
+        chunk = all_symbols[i:i + chunk_size]
+        if not chunk: continue
+        
+        chunk_idx = (i // chunk_size) + 1
+        progress_text.text(f"📥 正在批量下載歷史資料... (批次 {chunk_idx}/{total_chunks})")
+        bar.progress(chunk_idx / total_chunks)
+        
+        try:
+            # 使用 yfinance 批量下載
+            # group_by='ticker' 讓結構變成 Dict-like: df['2330.TW']
+            # auto_adjust=True 自動還原權值
+            tickers_str = " ".join(chunk)
+            batch_df = yf.download(tickers_str, period=period, group_by='ticker', threads=True, auto_adjust=True, progress=False)
+            
+            if not batch_df.empty:
+                # 處理多檔股票回傳 (MultiIndex)
+                if isinstance(batch_df.columns, pd.MultiIndex):
+                    for symbol in chunk:
+                        try:
+                            # 嘗試提取單檔 DataFrame
+                            if symbol in batch_df:
+                                stock_df = batch_df[symbol].dropna()
+                                if not stock_df.empty:
+                                    if stock_df.index.tz is not None: 
+                                        stock_df.index = stock_df.index.tz_localize(None)
+                                    code = symbol_to_code.get(symbol)
+                                    if code:
+                                        data_store[code] = stock_df
+                        except: pass
+                else:
+                    # 處理單檔股票回傳 (若 chunk 只有 1 檔或只成功 1 檔)
+                    # yfinance 有時會直接回傳單層 DataFrame
+                    try:
+                        # 這種情況比較少見，通常發生在 chunk=1
+                        stock_df = batch_df.dropna()
+                        if not stock_df.empty:
+                            if stock_df.index.tz is not None: 
+                                stock_df.index = stock_df.index.tz_localize(None)
+                            # 這裡假設只有一檔，稍微危險，但在大批次通常是 MultiIndex
+                            # 為了安全，若結構不對則略過
+                            pass 
+                    except: pass
+            
+            # 🛑 避免過於頻繁請求，批次間稍微暫停
+            time.sleep(1)
+            
+        except Exception as e:
+            st.toast(f"批次下載錯誤: {e}")
+            continue
+
+    progress_text.empty()
+    bar.empty()
+    return data_store
+
+def fetch_realtime_batch(codes_list, chunk_size=50):
+    """
+    批量下載即時資料 (twstock)
+    """
+    realtime_data = {}
+    progress_text = st.empty()
+    
+    total_chunks = (len(codes_list) // chunk_size) + 1
+    
+    for i in range(0, len(codes_list), chunk_size):
+        chunk = codes_list[i:i + chunk_size]
+        progress_text.text(f"⚡ 正在批量更新即時盤... ({i}/{len(codes_list)})")
+        
+        try:
+            # twstock 支援列表查詢
+            stocks = twstock.realtime.get(chunk)
+            
+            # 解析回傳資料
+            if stocks:
+                # 若只查一檔，twstock 回傳 dict，若多檔回傳 dict 的 dict
+                # 統一處理：檢查是否為 dict 且包含 'success' (單檔) 或是 dict of dicts
+                if 'success' in stocks: # 單檔
+                    if stocks['success']:
+                         realtime_data[stocks['info']['code']] = stocks['realtime']
+                else: # 多檔
+                    for code, data in stocks.items():
+                        if data['success']:
+                            realtime_data[code] = data['realtime']
+            
+            time.sleep(0.5) # 禮貌性暫停
+        except: pass
+        
+    progress_text.empty()
+    return realtime_data
+
+# ==========================================
+# 🧠 綜合分析引擎 (支援預載資料)
+# ==========================================
+def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sector_db, pre_loaded_df=None):
     try:
-        df = get_stock_data_with_realtime(code, info['symbol'], analysis_date_str)
-        if df is None or df.empty: return "無法取得資料 (yfinance/網路)"
-        if len(df) < 250: return "資料長度不足 (<250天)"
+        # 🔥 如果有預載資料，直接使用，否則才去下載 (相容舊模式)
+        if pre_loaded_df is not None:
+            df = pre_loaded_df.copy() # 複製一份以免汙染原始快取
+        else:
+            df = get_stock_data_with_realtime(code, info['symbol'], analysis_date_str)
+            
+        if df is None or df.empty: return "無法取得資料"
+        if len(df) < 200: return "資料長度不足 (<200天)" # 稍微放寬限制
 
         df['DateStr'] = df.index.strftime('%Y-%m-%d')
         if analysis_date_str not in df['DateStr'].values: return f"無 {analysis_date_str} 交易資料"
@@ -282,7 +377,7 @@ def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sect
 
         is_sniper_candidate = True
         if volume.iloc[idx] < s_min_vol: is_sniper_candidate = False
-        if s_use_year and close.iloc[idx] < ma_y.iloc[idx]: is_sniper_candidate = False
+        if s_use_year and len(ma_y) > idx and (pd.isna(ma_y.iloc[idx]) or close.iloc[idx] < ma_y.iloc[idx]): is_sniper_candidate = False
         if not (close.iloc[idx] > ma_t.iloc[idx] and ma_t.iloc[idx] > ma_t.iloc[idx-1]): is_sniper_candidate = False
 
         if is_sniper_candidate:
@@ -404,7 +499,7 @@ st.sidebar.caption("波段與短線的極致整合")
 analysis_date_input = st.sidebar.date_input("分析基準日", datetime.date.today())
 analysis_date_str = analysis_date_input.strftime('%Y-%m-%d')
 
-start_scan = st.sidebar.button("🚀 開始全域掃描", type="primary")
+start_scan = st.sidebar.button("🚀 開始全域掃描 (極速版)", type="primary")
 status_text = st.sidebar.empty()
 progress_bar = st.sidebar.empty()
 
@@ -423,7 +518,7 @@ with st.sidebar.expander("⚡ 隔日沖策略參數 (短線)", expanded=True):
     d_min_vol = st.number_input("隔日沖最小量 (張)", value=1000, step=500)
 
 st.sidebar.divider()
-max_workers_input = st.sidebar.slider("系統效能 (執行緒數)", 1, 32, 8)
+max_workers_input = st.sidebar.slider("策略運算效能 (執行緒數)", 1, 32, 16) # 加大預設值，因為現在只剩運算是瓶頸
 
 params = {
     's_ma_trend': s_ma_trend, 's_use_year': s_use_year, 
@@ -445,26 +540,60 @@ if start_scan:
     sniper_setup = []
     sniper_watching = []
     day_candidates = []
-    failed_list = [] # 儲存失敗的股票
+    failed_list = []
 
+    # 1️⃣ 階段一：批量下載歷史資料 (I/O Bound)
+    status_text.text("🔄 正在批量下載歷史資料 (yfinance)...")
+    history_data_store = fetch_data_batch(stock_map)
+    
+    # 2️⃣ 階段二：批量更新即時盤 (若為當日) (I/O Bound)
+    today_str = datetime.datetime.now().strftime('%Y-%m-%d')
+    realtime_map = {}
+    if analysis_date_str == today_str:
+        status_text.text("⚡ 正在批量更新即時盤 (twstock)...")
+        realtime_map = fetch_realtime_batch(list(history_data_store.keys()))
+
+    # 3️⃣ 階段三：資料合併與策略運算 (CPU Bound)
+    status_text.text("🧠 正在進行策略運算...")
     progress_bar.progress(0)
-    total = len(scan_codes)
-    done = 0
-    status_text.text(f"啟動雙策略引擎... ({total} 檔)")
+    
+    # 準備合併後的 DataFrames
+    tasks_data = {} # code: df
+    
+    for code, df in history_data_store.items():
+        # 如果有即時盤，進行合併
+        if code in realtime_map and realtime_map[code]['latest_trade_price'] != '-':
+            try:
+                rt = realtime_map[code]
+                new_row = pd.Series({
+                    'Open': float(rt['open']), 'High': float(rt['high']), 
+                    'Low': float(rt['low']), 'Close': float(rt['latest_trade_price']), 
+                    'Volume': float(rt['accumulate_trade_volume']) * 1000
+                }, name=pd.Timestamp(today_str))
+                # 簡單去重：如果歷史資料最後一天已經是今天，就覆蓋；否則新增
+                if df.index[-1].strftime('%Y-%m-%d') == today_str:
+                    df.iloc[-1] = new_row
+                else:
+                    df = pd.concat([df, new_row.to_frame().T])
+            except: pass
+        tasks_data[code] = df
 
-    # 傳遞 SECTOR_DB 給分析函式
+    # 使用執行緒池進行純策略運算
+    total = len(tasks_data)
+    done = 0
+    
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers_input) as executor:
-        futures = {executor.submit(analyze_combined_strategy, code, stock_map[code], analysis_date_str, params, SECTOR_DB): code for code in scan_codes}
+        # 將準備好的 DF 直接傳入
+        futures = {executor.submit(analyze_combined_strategy, code, stock_map[code], analysis_date_str, params, SECTOR_DB, df): code for code, df in tasks_data.items()}
         
         for future in concurrent.futures.as_completed(futures):
             done += 1
-            if done % 20 == 0 or done == total:
+            if done % 50 == 0 or done == total:
                 progress_bar.progress(done / total)
-                status_text.text(f"掃描中: {done}/{total}")
+                status_text.text(f"策略運算中: {done}/{total}")
             
             res = future.result()
             
-            # 判斷回傳是否為字典 (成功) 或是字串 (失敗)
             if isinstance(res, dict):
                 if res['sniper']:
                     typ, data = res['sniper']
@@ -475,14 +604,20 @@ if start_scan:
                 if res['day']:
                     day_candidates.append(res['day'])
             else:
-                # 若為字串，則視為錯誤訊息
                 current_code = futures[future]
                 stock_name = stock_map[current_code]['short_name']
                 reason = res if isinstance(res, str) else "未知錯誤"
                 failed_list.append(f"{current_code} {stock_name} : {reason}")
     
     progress_bar.progress(1.0)
-    status_text.success(f"掃描完成！ (成功: {total - len(failed_list)} / 失敗: {len(failed_list)})")
+    # 計算未下載到的股票 (Total Scan - Processed)
+    all_scan_set = set(scan_codes)
+    processed_set = set(tasks_data.keys())
+    missing_codes = all_scan_set - processed_set
+    for c in missing_codes:
+        failed_list.append(f"{c} : 下載失敗/無資料")
+
+    status_text.success(f"掃描完成！ (成功: {len(tasks_data)} / 失敗: {len(failed_list)})")
     
     st.session_state['scan_results'] = {
         'sniper_triggered': sniper_triggered,
