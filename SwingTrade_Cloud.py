@@ -1,5 +1,4 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import concurrent.futures
 import datetime
@@ -17,7 +16,7 @@ from backtesting import Backtest, Strategy
 # ==========================================
 DATA_DIR = "stock_data"  # 本地資料庫資料夾名稱 (對應 Fly.io Volume)
 
-# 確保資料夾存在
+# 確保資料夾存在 (雖然不下載，但讀取時需要此路徑)
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR)
 
@@ -80,10 +79,6 @@ def get_detailed_sector(code, standard_group=None, custom_db=None):
     if standard_group and str(standard_group) not in ['nan', 'None', '', 'NaN']: return str(standard_group)
     return "其他"
 
-def save_dataframe(code, df):
-    file_path = os.path.join(DATA_DIR, f"{code}.csv")
-    df.to_csv(file_path)
-
 def load_dataframe(code):
     file_path = os.path.join(DATA_DIR, f"{code}.csv")
     if os.path.exists(file_path):
@@ -111,8 +106,6 @@ def get_database_status():
 # ==========================================
 def SMA(array, n):
     return pd.Series(array).rolling(window=n).mean()
-
-# (Backtesting class omitted for brevity)
 
 def analyze_from_local(code, info, analysis_date_str, params, custom_sector_db):
     try:
@@ -198,7 +191,10 @@ def analyze_from_local(code, info, analysis_date_str, params, custom_sector_db):
                             has_broken_before = True
                             break
                     
+                    # 🔥 N字突破判斷
                     is_today_breakout = c_today > prev_h
+                    
+                    # 🔥 跳空且收紅檢查 (開高走低會被降級)
                     is_valid_gap = (op.iloc[idx] > prev_h) and (c_today > op.iloc[idx])
                     gap_str = "🚀 跳空" if is_valid_gap else "🎯 "
                     reentry_gap_str = "🚀 跳空" if is_valid_gap else "🚀 "
@@ -216,6 +212,8 @@ def analyze_from_local(code, info, analysis_date_str, params, custom_sector_db):
                                 result_sniper = ("triggered", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "產業": sector_name, "狀態": "🔥 強勢續漲", "訊號日": s_date, "突破價": f"{prev_h:.2f}"})
                     else:
                         curr_pct = (c_today - close.iloc[idx-1]) / close.iloc[idx-1]
+                        
+                        # 修正：跌破 Setup 最高價即視為回檔
                         if c_today < s_high:
                              result_sniper = ("watching", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "產業": sector_name, "狀態": "📉 回檔整理", "訊號日": s_date, "防守": f"{defense_price:.2f}", "長紅高": f"{s_high:.2f}", "漲跌幅": f"{curr_pct*100:.2f}%"})
                         else:
@@ -224,6 +222,7 @@ def analyze_from_local(code, info, analysis_date_str, params, custom_sector_db):
             elif is_setup:
                 prev_c = close.iloc[idx-1]
                 pct_chg = (c_today - prev_c) / prev_c * 100
+                # 🔥 剛起漲的跳空顯示 (也加上防開高走低)
                 is_gap_start = (low.iloc[idx] > high.iloc[idx-1]) and (c_today > op.iloc[idx])
                 status_str = "🚀 跳空起漲" if is_gap_start else "🔥 剛起漲"
                 result_sniper = ("new_setup", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "產業": sector_name, "狀態": status_str, "漲幅": f"{pct_chg:+.2f}%"})
@@ -269,7 +268,7 @@ def display_full_table(df):
 # 🖥️ 介面主程式
 # ==========================================
 st.sidebar.title("🔥 強勢股戰情室")
-st.sidebar.caption("純掃描版 (無自動更新)")
+st.sidebar.caption("純掃描版 (需外部資料源)")
 
 analysis_date_input = st.sidebar.date_input("分析基準日", datetime.date.today())
 analysis_date_str = analysis_date_input.strftime('%Y-%m-%d')
@@ -283,7 +282,7 @@ st.sidebar.text(f"檔案數: {db_file_count} 檔")
 st.sidebar.text(f"最新資料: {db_last_date}")
 
 if db_last_date != "無資料" and db_last_date < analysis_date_str:
-    st.sidebar.warning("⚠️ 資料庫非最新，請手動更新資料來源")
+    st.sidebar.warning(f"⚠️ 資料庫滯後 (最新: {db_last_date})")
 elif db_last_date == analysis_date_str:
     st.sidebar.success("✅ 資料庫已是最新")
 
@@ -321,6 +320,7 @@ if start_scan:
     if db_file_count < 100:
         st.error("⚠️ 資料庫為空！請確認 `stock_data` 資料夾內有數據。")
     else:
+        # 只掃描資料庫中存在的檔案
         db_files = [f.replace('.csv', '') for f in os.listdir(DATA_DIR) if f.endswith('.csv')]
         scan_codes = list(set(db_files) & set(stock_map.keys()))
         scan_codes.sort()
@@ -429,11 +429,7 @@ with tab3:
     if diag_btn:
         df = load_dataframe(stock_input)
         if df is None:
-             st.warning("⚠️ 本地無資料，嘗試從網路暫時抓取...")
-             try:
-                df = yf.Ticker(f"{stock_input}.TW").history(period="1y")
-                if df.empty: df = yf.Ticker(f"{stock_input}.TWO").history(period="1y")
-             except: pass
+             st.warning("⚠️ 本地無資料，無法診斷")
         
         if df is not None and not df.empty:
             if df.index.tz is not None: df.index = df.index.tz_localize(None)
@@ -447,4 +443,4 @@ with tab3:
             fig.add_trace(go.Bar(x=plot_df.index, y=plot_df['Volume'], name='成交量'), row=2, col=1)
             st.plotly_chart(fig, use_container_width=True)
         else:
-            st.error("查無資料")
+            if df is not None: st.error("查無資料")
