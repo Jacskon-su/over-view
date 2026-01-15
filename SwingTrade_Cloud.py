@@ -8,269 +8,302 @@ import time
 import random
 import importlib 
 import os
-import zipfile
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from backtesting import Backtest, Strategy
 
 # ==========================================
-# 🔧 設定
+# 🔧 設定與全域變數
 # ==========================================
-DATA_DIR = "stock_data"
-ZIP_FILE = "stock_data.zip"
+DATA_DIR = "stock_data"  # 本地資料庫資料夾名稱 (對應 Fly.io Volume)
 
-st.set_page_config(page_title="強勢股戰情室", page_icon="🔥", layout="wide")
-warnings.filterwarnings("ignore")
-
-# 嘗試載入細產業資料
-SECTOR_DB = {}
-try:
-    import sector_data
-    if hasattr(sector_data, 'CUSTOM_SECTOR_MAP'):
-        SECTOR_DB = {str(k).strip(): v for k, v in sector_data.CUSTOM_SECTOR_MAP.items()}
-except: pass
-
-# ==========================================
-# 📦 雲端自動解壓縮 (只在啟動時執行一次)
-# ==========================================
+# 確保資料夾存在
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR)
 
-# 檢查是否需要解壓 (如果資料夾是空的，且有 zip 檔)
-if len(os.listdir(DATA_DIR)) < 100 and os.path.exists(ZIP_FILE):
-    with st.spinner("📦 正在還原雲端資料庫..."):
-        try:
-            with zipfile.ZipFile(ZIP_FILE, 'r') as zip_ref:
-                zip_ref.extractall(".")
-            st.toast(f"✅ 資料庫還原成功！", icon="📂")
-        except Exception as e:
-            st.error(f"解壓縮失敗: {e}")
+# ==========================================
+# 🔥 匯入外部細產業資料庫
+# ==========================================
+SECTOR_DB = {}
+try:
+    import sector_data
+    importlib.reload(sector_data)
+    if hasattr(sector_data, 'CUSTOM_SECTOR_MAP'):
+        raw_map = sector_data.CUSTOM_SECTOR_MAP
+        SECTOR_DB = {str(k).strip(): v for k, v in raw_map.items()}
+except: pass
+
+warnings.filterwarnings("ignore")
 
 # ==========================================
-# 🛠️ 輔助函式
+# ⚙️ 頁面設定
+# ==========================================
+st.set_page_config(
+    page_title="強勢股戰情室 (純掃描版)",
+    page_icon="🔥",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+try:
+    import twstock
+except ImportError:
+    st.error("❌ 缺少 `twstock` 套件，請輸入 `pip install twstock` 安裝")
+    st.stop()
+
+st.markdown("""
+<style>
+    .stDataFrame {font-size: 1.1rem;}
+    [data-testid="stMetricValue"] {font-size: 1.5rem;}
+</style>
+""", unsafe_allow_html=True)
+
+# ==========================================
+# 🛠️ 輔助函式 (資料庫核心)
 # ==========================================
 @st.cache_data(ttl=3600)
 def get_stock_info_map():
     try:
-        import twstock
         stock_map = {}
-        for c, i in twstock.twse.items():
-            if len(c) == 4: stock_map[c] = {'name': f"{c} {i.name}", 'symbol': f"{c}.TW", 'short_name': i.name, 'group': getattr(i, 'group', '其他')}
-        for c, i in twstock.tpex.items():
-            if len(c) == 4: stock_map[c] = {'name': f"{c} {i.name}", 'symbol': f"{c}.TWO", 'short_name': i.name, 'group': getattr(i, 'group', '其他')}
+        for code, info in twstock.twse.items():
+            if len(code) == 4: 
+                stock_map[code] = {'name': f"{code} {info.name}", 'symbol': f"{code}.TW", 'short_name': info.name, 'group': getattr(info, 'group', '其他')}
+        for code, info in twstock.tpex.items():
+            if len(code) == 4: 
+                stock_map[code] = {'name': f"{code} {info.name}", 'symbol': f"{code}.TWO", 'short_name': info.name, 'group': getattr(info, 'group', '其他')}
         return stock_map
     except: return {}
 
-def get_detailed_sector(code, standard_group=None):
-    if code in SECTOR_DB: return SECTOR_DB[code]
-    return standard_group if standard_group else "其他"
+def get_detailed_sector(code, standard_group=None, custom_db=None):
+    code_str = str(code).strip() 
+    if custom_db and code_str in custom_db: return str(custom_db[code_str])
+    if standard_group and str(standard_group) not in ['nan', 'None', '', 'NaN']: return str(standard_group)
+    return "其他"
 
-def load_data(code):
-    """讀取本地 CSV"""
-    path = os.path.join(DATA_DIR, f"{code}.csv")
-    if os.path.exists(path):
+def save_dataframe(code, df):
+    file_path = os.path.join(DATA_DIR, f"{code}.csv")
+    df.to_csv(file_path)
+
+def load_dataframe(code):
+    file_path = os.path.join(DATA_DIR, f"{code}.csv")
+    if os.path.exists(file_path):
         try:
-            df = pd.read_csv(path, index_col=0, parse_dates=True)
-            if df.index.tz is not None: df.index = df.index.tz_localize(None)
+            df = pd.read_csv(file_path, index_col=0, parse_dates=True)
             return df
         except: return None
     return None
 
+def get_database_status():
+    """取得資料庫的最新日期狀態"""
+    files = [f for f in os.listdir(DATA_DIR) if f.endswith('.csv')]
+    if not files: return "無資料", 0
+    
+    target_file = "2330.csv" if "2330.csv" in files else random.choice(files)
+    try:
+        df = pd.read_csv(os.path.join(DATA_DIR, target_file), index_col=0)
+        last_date = pd.to_datetime(df.index[-1]).strftime('%Y-%m-%d')
+        return last_date, len(files)
+    except:
+        return "讀取錯誤", len(files)
+
 # ==========================================
-# 🧠 核心分析引擎 (含即時盤補丁)
+# 🧠 策略核心
 # ==========================================
-def analyze_stock(code, info, params, fetch_realtime=False):
-    # 1. 讀取歷史資料
-    df = load_data(code)
-    if df is None or len(df) < 200: return None # 資料不足
+def SMA(array, n):
+    return pd.Series(array).rolling(window=n).mean()
 
-    # 2. 盤中即時補丁 (Real-time Patch)
-    # 如果使用者勾選「補齊今日資料」，則嘗試抓取最新報價並合併
-    if fetch_realtime:
-        try:
-            # 抓取最近 2 天 (確保包含今天)
-            rt_df = yf.download(info['symbol'], period="5d", interval="1d", progress=False, auto_adjust=True)
-            if not rt_df.empty:
-                if rt_df.index.tz is not None: rt_df.index = rt_df.index.tz_localize(None)
-                # 合併：用新的覆蓋舊的
-                df = pd.concat([df, rt_df])
-                df = df[~df.index.duplicated(keep='last')]
-        except: pass
+# (Backtesting class omitted for brevity)
 
-    # 3. 準備數據
-    close = df['Close']; high = df['High']; low = df['Low']; volume = df['Volume']; op = df['Open']
-    # 取得最後一天 (可能是今天盤中，也可能是昨天收盤)
-    idx = -1 
-    current_date = df.index[idx].strftime('%Y-%m-%d')
-    
-    # 排除無量
-    if volume.iloc[idx] < params['s_min_vol']: return None
-
-    # --- 策略運算 ---
-    # 均線
-    ma_trend = close.rolling(window=params['s_ma_trend']).mean()
-    ma_long = close.rolling(window=240).mean()
-    vol_ma = volume.rolling(window=5).mean()
-
-    # 趨勢濾網
-    is_trend_up = (close.iloc[idx] > ma_trend.iloc[idx]) and (ma_trend.iloc[idx] > ma_trend.iloc[idx-1])
-    if params['s_use_year'] and (close.iloc[idx] < ma_long.iloc[idx]): is_trend_up = False
-    
-    if not is_trend_up: return None
-
-    # 尋找 Setup Bar (回溯 10 天)
-    setup_found = False
-    s_high = 0; s_low = 0; s_close = 0; s_date = ""; setup_idx = -1
-    defense_price = 0
-    
-    for k in range(2, 12): # 從昨天往前推 (idx-1 是昨天)
-        b_idx = idx - k + 1
-        if b_idx < 0: break
+def analyze_from_local(code, info, analysis_date_str, params, custom_sector_db):
+    try:
+        df = load_dataframe(code)
         
-        # 條件：漲幅 > 3% 且 爆量 且 收紅
-        prev_c = close.iloc[b_idx-1]
-        is_big = (close.iloc[b_idx] - prev_c) / prev_c > params['s_big_candle']
-        is_vol = volume.iloc[b_idx] > vol_ma.iloc[b_idx]
-        is_red = close.iloc[b_idx] > op.iloc[b_idx]
+        if df is None or df.empty: return "無本地資料"
+        if df.index.tz is not None: df.index = df.index.tz_localize(None)
         
-        if is_big and is_vol and is_red:
-            setup_found = True
-            s_high = high.iloc[b_idx]
-            s_low = low.iloc[b_idx]
-            s_close = close.iloc[b_idx]
-            s_date = df.index[b_idx].strftime('%Y-%m-%d')
-            setup_idx = b_idx
-            
-            # 跳空判斷 (設定防守價)
-            prev_high_setup = high.iloc[b_idx-1]
-            prev_close_setup = close.iloc[b_idx-1]
-            if s_low > prev_high_setup:
-                defense_price = prev_close_setup # 守缺口
+        df['DateStr'] = df.index.strftime('%Y-%m-%d')
+        if analysis_date_str not in df['DateStr'].values: 
+            last_dt = df.index[-1]
+            target_dt = pd.Timestamp(analysis_date_str)
+            if (target_dt - last_dt).days > 5:
+                return f"資料過舊 (最後: {last_dt.strftime('%Y-%m-%d')})"
             else:
-                defense_price = s_low # 守低點
-            break
-    
-    result_sniper = None
-    result_day = None
-    sector_name = get_detailed_sector(code, info.get('group'))
+                if analysis_date_str not in df['DateStr'].values: return f"無 {analysis_date_str} 資料"
 
-    # --- 策略 A: 狙擊手 ---
-    if setup_found:
-        # 檢查是否破防守
-        is_broken = False
-        for k in range(setup_idx + 1, len(df)):
-            if close.iloc[k] < defense_price: 
-                is_broken = True; break
+        if len(df) < 250: return "長度不足"
         
-        if not is_broken:
-            # 歷史回溯：檢查 Setup 後到昨天為止，是否曾經突破過
-            has_broken_before = False
-            # 範圍：Setup隔天 ~ 昨天 (idx-1)
-            for k in range(setup_idx + 1, len(df) - 1):
-                if close.iloc[k] > high.iloc[k-1]:
-                    has_broken_before = True; break
+        idx = df.index.get_loc(pd.Timestamp(analysis_date_str))
+        
+        close = df['Close']; high = df['High']; low = df['Low']; volume = df['Volume']; op = df['Open']
+        stock_name = info['short_name']
+        sector_name = get_detailed_sector(code, standard_group=info.get('group'), custom_db=custom_sector_db)
+
+        result_sniper = None
+        result_day = None
+
+        # --- 策略 A: 狙擊手 (最終完整版) ---
+        s_ma_trend = params['s_ma_trend']
+        s_use_year = params['s_use_year']
+        s_big_candle = params['s_big_candle']
+        s_min_vol = params['s_min_vol']
+
+        ma_t = close.rolling(window=s_ma_trend).mean()
+        ma_y = close.rolling(window=240).mean()
+        vol_ma = volume.rolling(window=5).mean()
+
+        is_sniper_candidate = True
+        if volume.iloc[idx] < s_min_vol: is_sniper_candidate = False
+        if s_use_year and close.iloc[idx] < ma_y.iloc[idx]: is_sniper_candidate = False
+        if not (close.iloc[idx] > ma_t.iloc[idx] and ma_t.iloc[idx] > ma_t.iloc[idx-1]): is_sniper_candidate = False
+
+        if is_sniper_candidate:
+            is_setup = ((close.iloc[idx] - close.iloc[idx-1]) / close.iloc[idx-1] > s_big_candle and
+                        volume.iloc[idx] > vol_ma.iloc[idx] and close.iloc[idx] > op.iloc[idx])
             
-            # 今日數據
-            c_today = close.iloc[idx]
-            prev_h = high.iloc[idx-1]
-            today_open = op.iloc[idx]
+            setup_found = False
+            s_high = 0; s_low = 0; s_close = 0; s_date = ""; setup_idx = -1
+            defense_price = 0
             
-            # 判定今日是否突破
-            is_today_breakout = c_today > prev_h
-            
-            # 跳空檢查 (開盤 > 昨高) 且 (收紅 - 避免開高走低)
-            is_gap = (today_open > prev_h) and (c_today > today_open)
-            gap_tag = "🚀 跳空" if is_gap else "🎯 "
-            reentry_tag = "🚀 跳空" if is_gap else "🚀 "
-            
-            if is_today_breakout:
-                if not has_broken_before:
-                    # 第一次突破
-                    status = f"{gap_tag}N字突破"
-                    result_sniper = {"狀態": status, "日期": current_date}
-                else:
-                    # 曾突破過，檢查昨天狀態
-                    yesterday_c = close.iloc[idx-1]
-                    yesterday_prev_h = high.iloc[idx-2]
-                    was_strong = yesterday_c > yesterday_prev_h
+            for k in range(1, 11):
+                b_idx = idx - k
+                if b_idx < 1: break
+                if ((close.iloc[b_idx] - close.iloc[b_idx-1]) / close.iloc[b_idx-1] > s_big_candle and
+                    volume.iloc[b_idx] > vol_ma.iloc[b_idx] and close.iloc[b_idx] > op.iloc[b_idx]):
                     
-                    if not was_strong:
-                        # 昨天弱，今天強 -> 續漲 (回馬槍)
-                        status = f"{reentry_tag}N字續漲"
-                        result_sniper = {"狀態": status, "日期": current_date}
+                    setup_found = True; setup_idx = b_idx
+                    s_low = low.iloc[b_idx]; s_high = high.iloc[b_idx]; s_close = close.iloc[b_idx]
+                    s_date = df.index[b_idx].strftime('%Y-%m-%d')
+                    
+                    prev_high_setup = high.iloc[b_idx-1]; prev_close_setup = close.iloc[b_idx-1]
+                    
+                    if s_low > prev_high_setup:
+                        defense_price = prev_close_setup 
                     else:
-                        # 昨天強，今天強 -> 強勢續漲
-                        result_sniper = {"狀態": "🔥 強勢續漲", "日期": current_date}
-            else:
-                # 沒突破 -> 觀察名單
-                # 跌破 Setup 最高價視為回檔
-                state_str = "📉 回檔整理" if c_today < s_high else "💪 強勢整理"
-                curr_pct = (c_today - close.iloc[idx-1]) / close.iloc[idx-1]
-                result_sniper = {"狀態": state_str, "日期": current_date, "漲幅": f"{curr_pct:.2%}"}
+                        defense_price = s_low 
+                    break
+            
+            c_today = close.iloc[idx]
+            prev_h = high.iloc[idx-1] 
+            
+            if setup_found:
+                is_broken_defense = False
+                for k in range(setup_idx + 1, idx + 1):
+                    if close.iloc[k] < defense_price: 
+                        is_broken_defense = True; break
+                
+                if not is_broken_defense:
+                    has_broken_before = False
+                    for k in range(setup_idx + 1, idx): 
+                        if close.iloc[k] > high.iloc[k-1]:
+                            has_broken_before = True
+                            break
+                    
+                    is_today_breakout = c_today > prev_h
+                    is_valid_gap = (op.iloc[idx] > prev_h) and (c_today > op.iloc[idx])
+                    gap_str = "🚀 跳空" if is_valid_gap else "🎯 "
+                    reentry_gap_str = "🚀 跳空" if is_valid_gap else "🚀 "
+                    
+                    if is_today_breakout:
+                        if not has_broken_before:
+                            status_str = f"{gap_str}N字突破"
+                            result_sniper = ("triggered", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "產業": sector_name, "狀態": status_str, "訊號日": s_date, "突破價": f"{prev_h:.2f}"})
+                        else:
+                            was_yesterday_strong = close.iloc[idx-1] > high.iloc[idx-2]
+                            if not was_yesterday_strong:
+                                status_str = f"{reentry_gap_str}N字續漲"
+                                result_sniper = ("triggered", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "產業": sector_name, "狀態": status_str, "訊號日": s_date, "突破價": f"{prev_h:.2f}"})
+                            else:
+                                result_sniper = ("triggered", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "產業": sector_name, "狀態": "🔥 強勢續漲", "訊號日": s_date, "突破價": f"{prev_h:.2f}"})
+                    else:
+                        curr_pct = (c_today - close.iloc[idx-1]) / close.iloc[idx-1]
+                        if c_today < s_high:
+                             result_sniper = ("watching", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "產業": sector_name, "狀態": "📉 回檔整理", "訊號日": s_date, "防守": f"{defense_price:.2f}", "長紅高": f"{s_high:.2f}", "漲跌幅": f"{curr_pct*100:.2f}%"})
+                        else:
+                             result_sniper = ("watching", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "產業": sector_name, "狀態": "💪 強勢整理", "訊號日": s_date, "防守": f"{defense_price:.2f}", "長紅高": f"{s_high:.2f}", "漲跌幅": f"{curr_pct*100:.2f}%"})
 
-    # 剛起漲偵測
-    elif idx > 0:
-        prev_c = close.iloc[idx-1]
-        is_big = (close.iloc[idx] - prev_c) / prev_c > params['s_big_candle']
-        is_vol = volume.iloc[idx] > vol_ma.iloc[idx]
-        is_red = close.iloc[idx] > op.iloc[idx]
-        if is_big and is_vol and is_red:
-            # 檢查跳空 (防開高走低)
-            is_gap_start = (low.iloc[idx] > high.iloc[idx-1]) and (close.iloc[idx] > op.iloc[idx])
-            status = "🚀 跳空起漲" if is_gap_start else "🔥 剛起漲"
-            pct = (close.iloc[idx] - prev_c) / prev_c
-            result_sniper = {"狀態": status, "日期": current_date, "漲幅": f"{pct:.2%}"}
+            elif is_setup:
+                prev_c = close.iloc[idx-1]
+                pct_chg = (c_today - prev_c) / prev_c * 100
+                is_gap_start = (low.iloc[idx] > high.iloc[idx-1]) and (c_today > op.iloc[idx])
+                status_str = "🚀 跳空起漲" if is_gap_start else "🔥 剛起漲"
+                result_sniper = ("new_setup", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "產業": sector_name, "狀態": status_str, "漲幅": f"{pct_chg:+.2f}%"})
 
-    # --- 策略 B: 隔日沖 ---
-    # (保留原邏輯: 收紅, 上影線短, 漲幅3~9.5%, 近前高)
-    if result_sniper is None: # 簡化: 若符合狙擊手就不重複報
-        d_close = close.iloc[idx]
-        d_open = op.iloc[idx]
-        d_high = high.iloc[idx]
-        upper_shadow = (d_high - d_close) / d_close
-        pct_val = (d_close - close.iloc[idx-1]) / close.iloc[idx-1]
+        # --- 策略 B: 隔日沖 ---
+        d_period = params['d_period']; d_threshold = params['d_threshold']
+        d_min_vol = params['d_min_vol']; d_min_pct = params['d_min_pct']
+        d_close = close.iloc[idx]; d_open = op.iloc[idx]; d_high = high.iloc[idx]; d_volume = volume.iloc[idx]; d_prev_close = close.iloc[idx-1]
         
         is_red = d_close > d_open
+        upper_shadow = (d_high - d_close) / d_close
         is_strong_close = upper_shadow < 0.01
-        is_momentum = 0.03 < pct_val < 0.095
+        pct_chg_val = (d_close - d_prev_close) / d_prev_close
+        is_momentum_ok = (pct_chg_val > d_min_pct/100) and (pct_chg_val < 0.095)
+        is_vol_ok = (d_volume / 1000) > d_min_vol
         
-        if is_red and is_strong_close and is_momentum:
-            # 檢查是否近前高 (60日)
-            past_60_high = high.iloc[idx-60:idx].max()
-            if d_close >= past_60_high * 0.98 and d_high <= past_60_high: # 逼近但未過
-                 dist = (d_close - past_60_high) / past_60_high
-                 result_day = {
-                     "狀態": "⚡ 蓄勢待發", "距離前高": f"{dist:.2%}", 
-                     "日期": current_date
-                 }
+        if idx >= d_period:
+            prev_period_high = high.iloc[idx-d_period : idx].max()
+            threshold_factor = 1 - (d_threshold / 100)
+            is_near_high = d_close >= (prev_period_high * threshold_factor)
+            is_not_new_high = d_high <= prev_period_high
+            
+            if is_red and is_strong_close and is_momentum_ok and is_vol_ok and is_near_high and is_not_new_high:
+                dist_to_high = (d_close - prev_period_high) / prev_period_high * 100
+                result_day = {
+                    "代號": code, "名稱": stock_name, "收盤": f"{d_close:.2f}", "產業": sector_name,
+                    "漲幅": f"{(pct_chg_val*100):.2f}%", "成交量": int(d_volume/1000),
+                    "前波高點": f"{prev_period_high:.2f}", "距離高點": f"{dist_to_high:+.2f}%", "狀態": "⚡ 蓄勢待發"
+                }
 
-    # 整合回傳
-    final_res = {}
-    if result_sniper:
-        final_res['sniper'] = result_sniper
-        final_res['sniper'].update({"代號": code, "名稱": stock_name, "收盤": f"{close.iloc[idx]:.2f}", "產業": sector_name})
-    if result_day:
-        final_res['day'] = result_day
-        final_res['day'].update({"代號": code, "名稱": stock_name, "收盤": f"{close.iloc[idx]:.2f}", "產業": sector_name})
-        
-    return final_res if final_res else None
+        return {'sniper': result_sniper, 'day': result_day}
+
+    except Exception as e: return f"Error: {str(e)}"
+
+# 🔥 全展開表格顯示
+def display_full_table(df):
+    if df is not None and not df.empty:
+        height = (len(df) + 1) * 35
+        st.dataframe(df, hide_index=True, use_container_width=True, height=height)
+    else: st.info("無")
 
 # ==========================================
-# 🖥️ 介面
+# 🖥️ 介面主程式
 # ==========================================
 st.sidebar.title("🔥 強勢股戰情室")
-st.sidebar.caption("Github 雲端部署版")
+st.sidebar.caption("純掃描版 (無自動更新)")
 
-# 參數設定
-with st.sidebar.expander("策略參數", expanded=False):
+analysis_date_input = st.sidebar.date_input("分析基準日", datetime.date.today())
+analysis_date_str = analysis_date_input.strftime('%Y-%m-%d')
+
+stock_map = get_stock_info_map()
+db_last_date, db_file_count = get_database_status()
+
+st.sidebar.divider()
+st.sidebar.markdown(f"**📦 資料庫狀態**")
+st.sidebar.text(f"檔案數: {db_file_count} 檔")
+st.sidebar.text(f"最新資料: {db_last_date}")
+
+if db_last_date != "無資料" and db_last_date < analysis_date_str:
+    st.sidebar.warning("⚠️ 資料庫非最新，請手動更新資料來源")
+elif db_last_date == analysis_date_str:
+    st.sidebar.success("✅ 資料庫已是最新")
+
+start_scan = st.sidebar.button("🚀 執行策略掃描", type="primary")
+scan_status = st.sidebar.empty()
+scan_progress = st.sidebar.empty()
+
+st.sidebar.divider()
+
+with st.sidebar.expander("🟢 狙擊手策略參數", expanded=True):
     s_ma_trend = st.number_input("趨勢線 (MA)", value=60)
     s_use_year = st.checkbox("啟用年線 (240MA)", value=True)
-    s_big_candle = st.slider("長紅漲幅 (%)", 0.03, 0.1, 0.03)
-    s_min_vol = st.number_input("最小量 (張)", value=1000) * 1000
-    
-    d_period = 60
-    d_threshold = 1.0
-    d_min_pct = 3.0
-    d_min_vol = 1000
+    s_big_candle = st.slider("長紅漲幅門檻 (%)", 2.0, 10.0, 3.0, 0.5) / 100
+    s_min_vol = st.number_input("波段最小量 (張)", value=1000) * 1000
+
+with st.sidebar.expander("⚡ 隔日沖策略參數", expanded=False):
+    d_period = st.slider("追蹤波段 (N)", 10, 120, 60, 5)
+    d_threshold = st.slider("高點誤差 (%)", 0.0, 5.0, 1.0, 0.1)
+    d_min_pct = st.slider("最低漲幅 (%)", 3.0, 9.0, 5.0, 0.1)
+    d_min_vol = st.number_input("隔日沖最小量", value=1000, step=500)
 
 params = {
     's_ma_trend': s_ma_trend, 's_use_year': s_use_year, 
@@ -279,72 +312,139 @@ params = {
     'd_min_pct': d_min_pct, 'd_min_vol': d_min_vol
 }
 
-# 按鈕區
-col_btn1, col_btn2 = st.columns([1,2])
-with col_btn1:
-    fetch_realtime = st.checkbox("盤中即時補資料", value=True, help="勾選後，掃描時會嘗試抓取每檔股票的當日最新報價合併計算。")
-with col_btn2:
-    start_scan = st.button("🚀 執行策略掃描", type="primary")
+tab1, tab2, tab3 = st.tabs(["🟢 波段策略", "⚡ 短線雷達", "📊 個股診斷"])
 
-# 顯示資料庫狀態
-file_count = len([f for f in os.listdir(DATA_DIR) if f.endswith('.csv')])
-st.info(f"📚 資料庫狀態：{file_count} 檔 (來自 ZIP)")
+if 'scan_results' not in st.session_state:
+    st.session_state['scan_results'] = None
 
 if start_scan:
-    if file_count < 100:
-        st.error("⚠️ 資料庫為空！請確認 GitHub 上傳了 stock_data.zip。")
+    if db_file_count < 100:
+        st.error("⚠️ 資料庫為空！請確認 `stock_data` 資料夾內有數據。")
     else:
-        stock_map = get_stock_info_map()
-        # 1. 讀取現有檔案列表
         db_files = [f.replace('.csv', '') for f in os.listdir(DATA_DIR) if f.endswith('.csv')]
-        # 2. 取交集 (確保有資料且在清單內)
         scan_codes = list(set(db_files) & set(stock_map.keys()))
         scan_codes.sort()
         
-        results_s = []
-        results_d = []
+        excluded_count = len(stock_map) - len(scan_codes)
+        if excluded_count > 0:
+            st.toast(f"ℹ️ 已自動排除 {excluded_count} 檔無資料/下市股票", icon="🗑️")
+
+        sniper_triggered = []; sniper_setup = []; sniper_watching = []; day_candidates = []; failed_list = []
+
+        scan_status.text(f"讀取硬碟資料並運算中... (共 {len(scan_codes)} 檔)")
+        scan_progress.progress(0)
         
-        bar = st.progress(0)
-        status = st.empty()
-        
-        # 平行運算
         with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
-            futures = {executor.submit(analyze_stock, code, stock_map[code], params, fetch_realtime): code for code in scan_codes}
+            futures = {executor.submit(analyze_from_local, code, stock_map[code], analysis_date_str, params, SECTOR_DB): code for code in scan_codes}
             
             total = len(scan_codes); done = 0
             for future in concurrent.futures.as_completed(futures):
                 done += 1
-                if done % 50 == 0: 
-                    bar.progress(done / total)
-                    status.text(f"掃描中... {done}/{total}")
+                if done % 100 == 0: scan_progress.progress(done / total)
                 
                 res = future.result()
-                if res:
-                    if 'sniper' in res: results_s.append(res['sniper'])
-                    if 'day' in res: results_d.append(res['day'])
+                if isinstance(res, dict):
+                    if res['sniper']:
+                        typ, data = res['sniper']
+                        if typ == "triggered": sniper_triggered.append(data)
+                        elif typ == "new_setup": sniper_setup.append(data)
+                        elif typ == "watching": sniper_watching.append(data)
+                    if res['day']: day_candidates.append(res['day'])
+                else:
+                    current_code = futures[future]
+                    stock_name = stock_map[current_code]['short_name']
+                    failed_list.append(f"{current_code} {stock_name} : {res}")
+
+        scan_progress.progress(1.0)
+        scan_status.success(f"掃描完成！ (成功: {len(scan_codes) - len(failed_list)} / 失敗: {len(failed_list)})")
         
-        bar.progress(1.0)
-        status.success("掃描完成！")
+        st.session_state['scan_results'] = {
+            'sniper_triggered': sniper_triggered,
+            'sniper_setup': sniper_setup,
+            'sniper_watching': sniper_watching,
+            'day_candidates': day_candidates,
+            'failed_list': failed_list
+        }
+
+results = st.session_state['scan_results']
+
+with tab1:
+    st.header("🟢 狙擊手波段")
+    if results:
+        if results['failed_list']:
+             with st.expander(f"⚠️ 掃描失敗/無資料清單 ({len(results['failed_list'])})", expanded=False):
+                st.write(", ".join(results['failed_list']))
         
-        # --- 顯示結果 ---
-        tab1, tab2 = st.tabs(["🟢 波段策略", "⚡ 隔日沖"])
+        s_trig = results['sniper_triggered']
         
-        with tab1:
-            if results_s:
-                df_s = pd.DataFrame(results_s)
-                # 分類顯示
-                for status_key in ["N字突破", "N字續漲", "強勢續漲", "剛起漲", "強勢整理", "回檔整理"]:
-                    # 過濾包含該關鍵字的狀態
-                    df_part = df_s[df_s['狀態'].str.contains(status_key)]
-                    if not df_part.empty:
-                        st.subheader(f"{status_key} 清單 ({len(df_part)})")
-                        st.dataframe(df_part, hide_index=True, use_container_width=True)
-            else:
-                st.info("無符合標的")
-                
-        with tab2:
-            if results_d:
-                df_d = pd.DataFrame(results_d)
-                st.dataframe(df_d, hide_index=True, use_container_width=True)
-            else:
-                st.info("無符合標的")
+        trig_strong = [x for x in s_trig if "N字突破" in x['狀態']]
+        trig_reentry = [x for x in s_trig if "N字續漲" in x['狀態']]
+        trig_continue = [x for x in s_trig if "強勢續漲" in x['狀態']]
+
+        if trig_strong: 
+            st.markdown(f"### 🎯 N字突破 ({len(trig_strong)})")
+            display_full_table(pd.DataFrame(trig_strong))
+        
+        if trig_reentry: 
+            st.markdown(f"### 🚀 N字續漲 (回測再攻) ({len(trig_reentry)})")
+            display_full_table(pd.DataFrame(trig_reentry))
+            
+        if trig_continue: 
+            st.markdown(f"### 🔥 強勢續漲 (持倉) ({len(trig_continue)})")
+            display_full_table(pd.DataFrame(trig_continue))
+        
+        s_setup = results['sniper_setup']
+        if s_setup:
+            st.markdown(f"### 🔥 剛起漲 ({len(s_setup)})")
+            display_full_table(pd.DataFrame(s_setup))
+            
+        s_watch = results['sniper_watching']
+        if s_watch:
+            watch_strong = [x for x in s_watch if "強勢整理" in x['狀態']]
+            watch_pullback = [x for x in s_watch if "回檔整理" in x['狀態']]
+
+            if watch_strong:
+                st.markdown(f"### 💪 強勢整理 ({len(watch_strong)})")
+                display_full_table(pd.DataFrame(watch_strong))
+            
+            if watch_pullback:
+                st.markdown(f"### 📉 回檔整理 ({len(watch_pullback)})")
+                display_full_table(pd.DataFrame(watch_pullback))
+
+with tab2:
+    st.header("⚡ 隔日沖雷達")
+    if results and results['day_candidates']:
+        df_day = pd.DataFrame(results['day_candidates'])
+        df_day['sort_val'] = df_day['距離高點'].str.rstrip('%').astype(float)
+        df_day = df_day.sort_values(by='sort_val', ascending=False).drop(columns=['sort_val'])
+        st.markdown(f"### ⚡ 蓄勢待發 ({len(df_day)})")
+        display_full_table(df_day)
+
+with tab3:
+    st.header("📊 個股 K 線診斷")
+    col_in, col_btn = st.columns([3, 1])
+    with col_in: stock_input = st.text_input("輸入代號", value="2330")
+    with col_btn: diag_btn = st.button("診斷")
+    
+    if diag_btn:
+        df = load_dataframe(stock_input)
+        if df is None:
+             st.warning("⚠️ 本地無資料，嘗試從網路暫時抓取...")
+             try:
+                df = yf.Ticker(f"{stock_input}.TW").history(period="1y")
+                if df.empty: df = yf.Ticker(f"{stock_input}.TWO").history(period="1y")
+             except: pass
+        
+        if df is not None and not df.empty:
+            if df.index.tz is not None: df.index = df.index.tz_localize(None)
+            df['MA_Trend'] = df['Close'].rolling(window=s_ma_trend).mean()
+            df['MA_Base'] = df['Close'].rolling(window=20).mean()
+            plot_df = df.tail(250)
+            
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3])
+            fig.add_trace(go.Candlestick(x=plot_df.index, open=plot_df['Open'], high=plot_df['High'], low=plot_df['Low'], close=plot_df['Close'], name='K線'), row=1, col=1)
+            fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA_Trend'], line=dict(color='blue'), name=f'{s_ma_trend}MA'), row=1, col=1)
+            fig.add_trace(go.Bar(x=plot_df.index, y=plot_df['Volume'], name='成交量'), row=2, col=1)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.error("查無資料")
