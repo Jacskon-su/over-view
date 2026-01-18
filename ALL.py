@@ -404,6 +404,8 @@ def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sect
                     prev_high_setup = high.iloc[b_idx-1]
                     prev_close_setup = close.iloc[b_idx-1]
                     
+                    # 1. 訊號紅K防守點邏輯：
+                    # 若為跳空（低點 > 前高），防守價改為前一根K棒收盤價
                     if s_low > prev_high_setup:
                         defense_price = prev_close_setup
                     else:
@@ -411,7 +413,11 @@ def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sect
                     break
             
             c_today = close.iloc[idx]
+            prev_close_today = close.iloc[idx-1]
             prev_h = high.iloc[idx-1]
+            
+            # 🔥 計算當日漲幅
+            daily_pct = (c_today - prev_close_today) / prev_close_today * 100
             
             if setup_found:
                 is_broken = False; dropped_below_high = False
@@ -422,26 +428,37 @@ def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sect
 
                 if not is_broken:
                     is_breakout = c_today > prev_h
+                    
+                    # 2. 新增跳空突破邏輯：
+                    # 今日開盤 > 昨日高 (跳空過高) 且 今日收紅 (收盤 > 開盤)
+                    is_gap_breakout = (op.iloc[idx] > high.iloc[idx-1]) and (close.iloc[idx] > op.iloc[idx])
 
                     if not dropped_below_high:
                         pct_from_setup = (c_today - s_close) / s_close
                         if pct_from_setup <= 0.10:
                             if is_breakout:
-                                result_sniper = ("triggered", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "產業": sector_name, "狀態": "🚀 強勢突破", "訊號日": s_date, "突破價": f"{prev_h:.2f}"})
+                                result_sniper = ("triggered", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "漲幅": f"{daily_pct:+.2f}%", "產業": sector_name, "狀態": "🚀 強勢突破", "訊號日": s_date, "突破價": f"{prev_h:.2f}", "sort_pct": daily_pct})
                             else:
-                                curr_pct = (c_today - close.iloc[idx-1]) / close.iloc[idx-1]
-                                result_sniper = ("watching", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "產業": sector_name, "狀態": "💪 強勢整理", "訊號日": s_date, "防守": f"{defense_price:.2f}", "長紅高": f"{s_high:.2f}", "漲跌幅": f"{curr_pct*100:.2f}%"})
+                                result_sniper = ("watching", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "漲幅": f"{daily_pct:+.2f}%", "產業": sector_name, "狀態": "💪 強勢整理", "訊號日": s_date, "防守": f"{defense_price:.2f}", "長紅高": f"{s_high:.2f}", "sort_pct": daily_pct})
                     else:
-                        if is_breakout:
-                            result_sniper = ("triggered", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "產業": sector_name, "狀態": "🎯 N字突破", "訊號日": s_date, "突破價": f"{prev_h:.2f}"})
+                        # N字突破邏輯 (曾跌破訊號高點)
+                        
+                        # 條件 A: 乖離率限制 (前一日收盤價不可過度偏離訊號高點)
+                        prev_close_valid = close.iloc[idx-1] <= (s_high * 1.02)
+                        
+                        # 綜合判斷：
+                        # 1. 是一般突破 且 符合乖離限制
+                        # 2. 或是 跳空強勢突破 (無視乖離限制)
+                        if (is_breakout and prev_close_valid) or is_gap_breakout:
+                            status_str = "🚀 N字跳空" if is_gap_breakout else "🎯 N字突破"
+                            result_sniper = ("triggered", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "漲幅": f"{daily_pct:+.2f}%", "產業": sector_name, "狀態": status_str, "訊號日": s_date, "突破價": f"{prev_h:.2f}", "sort_pct": daily_pct})
                         else:
-                            curr_pct = (c_today - close.iloc[idx-1]) / close.iloc[idx-1]
-                            result_sniper = ("watching", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "產業": sector_name, "狀態": "📉 回檔整理", "訊號日": s_date, "防守": f"{defense_price:.2f}", "長紅高": f"{s_high:.2f}", "漲跌幅": f"{curr_pct*100:.2f}%"})
+                            result_sniper = ("watching", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "漲幅": f"{daily_pct:+.2f}%", "產業": sector_name, "狀態": "📉 回檔整理", "訊號日": s_date, "防守": f"{defense_price:.2f}", "長紅高": f"{s_high:.2f}", "sort_pct": daily_pct})
             
             elif is_setup:
                 prev_c = close.iloc[idx-1]
                 pct_chg = (c_today - prev_c) / prev_c * 100
-                result_sniper = ("new_setup", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "產業": sector_name, "狀態": "🔥 剛起漲", "漲幅": f"{pct_chg:+.2f}%"})
+                result_sniper = ("new_setup", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "產業": sector_name, "狀態": "🔥 剛起漲", "漲幅": f"{pct_chg:+.2f}%", "sort_pct": pct_chg})
 
         # --- 策略 B: 隔日沖 ---
         d_period = params['d_period']
@@ -641,7 +658,7 @@ with tab1:
                 
         s_trig = results['sniper_triggered']
         trig_strong = [x for x in s_trig if "強勢突破" in x['狀態']]
-        trig_n = [x for x in s_trig if "N字突破" in x['狀態']]
+        trig_n = [x for x in s_trig if "N字" in x['狀態']] # 包含 N字突破 和 N字跳空
         
         s_watch = results['sniper_watching']
         watch_strong = [x for x in s_watch if "強勢整理" in x['狀態']]
@@ -651,10 +668,16 @@ with tab1:
             st.markdown("### 🎯 買點觸發訊號 (Actionable)")
             if trig_strong:
                 st.markdown(f"### 🚀 強勢突破 ({len(trig_strong)})") 
-                display_full_table(pd.DataFrame(trig_strong))
+                df = pd.DataFrame(trig_strong)
+                if 'sort_pct' in df.columns:
+                    df = df.sort_values(by='sort_pct', ascending=False).drop(columns=['sort_pct'])
+                display_full_table(df)
             if trig_n:
                 st.markdown(f"### 🎯 N字突破 ({len(trig_n)})")
-                display_full_table(pd.DataFrame(trig_n))
+                df = pd.DataFrame(trig_n)
+                if 'sort_pct' in df.columns:
+                    df = df.sort_values(by='sort_pct', ascending=False).drop(columns=['sort_pct'])
+                display_full_table(df)
         
         if results['sniper_setup'] or watch_strong or watch_pullback:
             if trig_strong or trig_n: st.divider()
@@ -662,15 +685,24 @@ with tab1:
             
             if results['sniper_setup']:
                 st.markdown(f"### 🔥 今日剛起漲 ({len(results['sniper_setup'])})")
-                display_full_table(pd.DataFrame(results['sniper_setup']))
+                df = pd.DataFrame(results['sniper_setup'])
+                if 'sort_pct' in df.columns:
+                    df = df.sort_values(by='sort_pct', ascending=False).drop(columns=['sort_pct'])
+                display_full_table(df)
             
             if watch_strong:
                 st.markdown(f"### 💪 強勢整理 ({len(watch_strong)})")
-                display_full_table(pd.DataFrame(watch_strong))
+                df = pd.DataFrame(watch_strong)
+                if 'sort_pct' in df.columns:
+                    df = df.sort_values(by='sort_pct', ascending=False).drop(columns=['sort_pct'])
+                display_full_table(df)
             
             if watch_pullback:
                 st.markdown(f"### 📉 回檔整理 ({len(watch_pullback)})")
-                display_full_table(pd.DataFrame(watch_pullback))
+                df = pd.DataFrame(watch_pullback)
+                if 'sort_pct' in df.columns:
+                    df = df.sort_values(by='sort_pct', ascending=False).drop(columns=['sort_pct'])
+                display_full_table(df)
         
         if not (s_trig or results['sniper_setup'] or s_watch):
             st.info("今日無符合狙擊手策略之標的。")
