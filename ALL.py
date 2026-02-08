@@ -76,6 +76,7 @@ class SniperStrategy(Strategy):
     min_volume_shares = 2000000
     lookback_window = 10
     use_year_line = True 
+    defense_buffer = 0.01 # 🌟 新增：1% 緩衝空間
     
     def init(self):
         close = pd.Series(self.data.Close)
@@ -138,20 +139,19 @@ class SniperStrategy(Strategy):
                 
                 prev_high_setup = self.data.High[-2]
                 prev_close_setup = self.data.Close[-2]
+                
+                # 🌟 修改：防守價加入 1% 緩衝
                 if self.data.Low[-1] > prev_high_setup:
-                    self.defense_price = prev_close_setup
+                    base_val = prev_close_setup
                 else:
-                    self.defense_price = self.data.Low[-1]
+                    base_val = self.data.Low[-1]
+                
+                self.defense_price = base_val * (1 - self.defense_buffer)
 
 # ==========================================
 # 🛠️ 輔助函式與資料庫
 # ==========================================
 def get_detailed_sector(code, standard_group=None, custom_db=None):
-    """
-    取得細分產業 (修正版)：
-    1. 強制檢查 custom_db (細產業)
-    2. 若無，則查詢官方分類
-    """
     code_str = str(code).strip() 
     if custom_db and code_str in custom_db:
         return str(custom_db[code_str])
@@ -167,7 +167,6 @@ def get_detailed_sector(code, standard_group=None, custom_db=None):
 
 @st.cache_data(ttl=3600)
 def get_stock_info_map():
-    """取得上市櫃股票資訊表"""
     try:
         stock_map = {}
         for code, info in twstock.twse.items():
@@ -190,7 +189,6 @@ def get_stock_info_map():
     except:
         return {}
 
-# 🟢 舊版函式 (保留給個股診斷用)
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_history_data(symbol, start_date=None, end_date=None, period="2y"):
     try:
@@ -229,18 +227,11 @@ def get_stock_data_with_realtime(code, symbol, analysis_date_str):
 # 🚀 批量下載加速模組 (New Batch Engine)
 # ==========================================
 def fetch_data_batch(stock_map, period="1y", chunk_size=100):
-    """
-    批量下載歷史資料 (加速核心)
-    """
-    # 準備下載清單
     all_codes = list(stock_map.keys())
     all_symbols = [info['symbol'] for info in stock_map.values()]
     data_store = {}
-    
-    # 建立反向對照表 (Symbol -> Code)
     symbol_to_code = {v['symbol']: k for k, v in stock_map.items()}
 
-    # 分批處理
     total_chunks = (len(all_symbols) // chunk_size) + 1
     progress_text = st.empty()
     bar = st.progress(0)
@@ -254,18 +245,13 @@ def fetch_data_batch(stock_map, period="1y", chunk_size=100):
         bar.progress(chunk_idx / total_chunks)
         
         try:
-            # 使用 yfinance 批量下載
-            # group_by='ticker' 讓結構變成 Dict-like: df['2330.TW']
-            # auto_adjust=True 自動還原權值
             tickers_str = " ".join(chunk)
             batch_df = yf.download(tickers_str, period=period, group_by='ticker', threads=True, auto_adjust=True, progress=False)
             
             if not batch_df.empty:
-                # 處理多檔股票回傳 (MultiIndex)
                 if isinstance(batch_df.columns, pd.MultiIndex):
                     for symbol in chunk:
                         try:
-                            # 嘗試提取單檔 DataFrame
                             if symbol in batch_df:
                                 stock_df = batch_df[symbol].dropna()
                                 if not stock_df.empty:
@@ -275,23 +261,7 @@ def fetch_data_batch(stock_map, period="1y", chunk_size=100):
                                     if code:
                                         data_store[code] = stock_df
                         except: pass
-                else:
-                    # 處理單檔股票回傳 (若 chunk 只有 1 檔或只成功 1 檔)
-                    # yfinance 有時會直接回傳單層 DataFrame
-                    try:
-                        # 這種情況比較少見，通常發生在 chunk=1
-                        stock_df = batch_df.dropna()
-                        if not stock_df.empty:
-                            if stock_df.index.tz is not None: 
-                                stock_df.index = stock_df.index.tz_localize(None)
-                            # 這裡假設只有一檔，稍微危險，但在大批次通常是 MultiIndex
-                            # 為了安全，若結構不對則略過
-                            pass 
-                    except: pass
-            
-            # 🛑 避免過於頻繁請求，批次間稍微暫停
             time.sleep(1)
-            
         except Exception as e:
             st.toast(f"批次下載錯誤: {e}")
             continue
@@ -301,37 +271,25 @@ def fetch_data_batch(stock_map, period="1y", chunk_size=100):
     return data_store
 
 def fetch_realtime_batch(codes_list, chunk_size=50):
-    """
-    批量下載即時資料 (twstock)
-    """
     realtime_data = {}
     progress_text = st.empty()
-    
     total_chunks = (len(codes_list) // chunk_size) + 1
     
     for i in range(0, len(codes_list), chunk_size):
         chunk = codes_list[i:i + chunk_size]
         progress_text.text(f"⚡ 正在批量更新即時盤... ({i}/{len(codes_list)})")
-        
         try:
-            # twstock 支援列表查詢
             stocks = twstock.realtime.get(chunk)
-            
-            # 解析回傳資料
             if stocks:
-                # 若只查一檔，twstock 回傳 dict，若多檔回傳 dict 的 dict
-                # 統一處理：檢查是否為 dict 且包含 'success' (單檔) 或是 dict of dicts
-                if 'success' in stocks: # 單檔
+                if 'success' in stocks: 
                     if stocks['success']:
                          realtime_data[stocks['info']['code']] = stocks['realtime']
-                else: # 多檔
+                else: 
                     for code, data in stocks.items():
                         if data['success']:
                             realtime_data[code] = data['realtime']
-            
-            time.sleep(0.5) # 禮貌性暫停
+            time.sleep(0.5)
         except: pass
-        
     progress_text.empty()
     return realtime_data
 
@@ -340,14 +298,13 @@ def fetch_realtime_batch(codes_list, chunk_size=50):
 # ==========================================
 def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sector_db, pre_loaded_df=None):
     try:
-        # 🔥 如果有預載資料，直接使用，否則才去下載 (相容舊模式)
         if pre_loaded_df is not None:
-            df = pre_loaded_df.copy() # 複製一份以免汙染原始快取
+            df = pre_loaded_df.copy()
         else:
             df = get_stock_data_with_realtime(code, info['symbol'], analysis_date_str)
             
         if df is None or df.empty: return "無法取得資料"
-        if len(df) < 200: return "資料長度不足 (<200天)" # 稍微放寬限制
+        if len(df) < 200: return "資料長度不足 (<200天)"
 
         df['DateStr'] = df.index.strftime('%Y-%m-%d')
         if analysis_date_str not in df['DateStr'].values: return f"無 {analysis_date_str} 交易資料"
@@ -359,7 +316,6 @@ def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sect
         volume = df['Volume']
         op = df['Open']
         stock_name = info['short_name']
-        
         sector_name = get_detailed_sector(code, standard_group=info.get('group'), custom_db=custom_sector_db)
 
         result_sniper = None
@@ -404,33 +360,31 @@ def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sect
                     prev_high_setup = high.iloc[b_idx-1]
                     prev_close_setup = close.iloc[b_idx-1]
                     
-                    # 1. 訊號紅K防守點邏輯：
-                    # 若為跳空（低點 > 前高），防守價改為前一根K棒收盤價
+                    # 🚀 修正邏輯：訊號紅K防守點邏輯 (含 1% 誤差)
                     if s_low > prev_high_setup:
-                        defense_price = prev_close_setup
+                        base_val = prev_close_setup
                     else:
-                        defense_price = s_low
+                        base_val = s_low
+                    
+                    # 最低點或基準點向下給予 1% 緩衝
+                    defense_price = base_val * 0.99
                     break
             
             c_today = close.iloc[idx]
             prev_close_today = close.iloc[idx-1]
             prev_h = high.iloc[idx-1]
-            
-            # 🔥 計算當日漲幅
             daily_pct = (c_today - prev_close_today) / prev_close_today * 100
             
             if setup_found:
                 is_broken = False; dropped_below_high = False
                 for k in range(setup_idx + 1, idx + 1):
                     c_k = close.iloc[k]
+                    # 修改：判斷收盤是否跌破含 1% 誤差的防守價
                     if c_k < defense_price: is_broken = True; break
                     if c_k < s_high: dropped_below_high = True
 
                 if not is_broken:
                     is_breakout = c_today > prev_h
-                    
-                    # 2. 新增跳空突破邏輯：
-                    # 今日開盤 > 昨日高 (跳空過高) 且 今日收紅 (收盤 > 開盤)
                     is_gap_breakout = (op.iloc[idx] > high.iloc[idx-1]) and (close.iloc[idx] > op.iloc[idx])
 
                     if not dropped_below_high:
@@ -441,14 +395,7 @@ def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sect
                             else:
                                 result_sniper = ("watching", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "漲幅": f"{daily_pct:+.2f}%", "產業": sector_name, "狀態": "💪 強勢整理", "訊號日": s_date, "防守": f"{defense_price:.2f}", "長紅高": f"{s_high:.2f}", "sort_pct": daily_pct})
                     else:
-                        # N字突破邏輯 (曾跌破訊號高點)
-                        
-                        # 條件 A: 乖離率限制 (前一日收盤價不可過度偏離訊號高點)
                         prev_close_valid = close.iloc[idx-1] <= (s_high * 1.02)
-                        
-                        # 綜合判斷：
-                        # 1. 是一般突破 且 符合乖離限制
-                        # 2. 或是 跳空強勢突破 (無視乖離限制)
                         if (is_breakout and prev_close_valid) or is_gap_breakout:
                             status_str = "🚀 N字跳空" if is_gap_breakout else "🎯 N字突破"
                             result_sniper = ("triggered", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "漲幅": f"{daily_pct:+.2f}%", "產業": sector_name, "狀態": status_str, "訊號日": s_date, "突破價": f"{prev_h:.2f}", "sort_pct": daily_pct})
@@ -484,18 +431,11 @@ def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sect
             if is_red and is_strong_close and is_momentum_ok and is_vol_ok and is_near_high and is_not_new_high:
                 dist_to_high = (d_close - prev_period_high) / prev_period_high * 100
                 result_day = {
-                    "代號": code,
-                    "名稱": stock_name,
-                    "收盤": f"{d_close:.2f}",
-                    "產業": sector_name,
-                    "漲幅": f"{(pct_chg_val*100):.2f}%",
-                    "成交量": int(d_volume/1000),
-                    "前波高點": f"{prev_period_high:.2f}",
-                    "距離高點": f"{dist_to_high:+.2f}%",
-                    "狀態": "⚡ 蓄勢待發"
+                    "代號": code, "名稱": stock_name, "收盤": f"{d_close:.2f}", "產業": sector_name,
+                    "漲幅": f"{(pct_chg_val*100):.2f}%", "成交量": int(d_volume/1000),
+                    "前波高點": f"{prev_period_high:.2f}", "距離高點": f"{dist_to_high:+.2f}%", "狀態": "⚡ 蓄勢待發"
                 }
 
-        # 成功回傳字典
         return {'sniper': result_sniper, 'day': result_day}
 
     except Exception as e: return f"程式執行錯誤: {str(e)}"
@@ -535,7 +475,7 @@ with st.sidebar.expander("⚡ 隔日沖策略參數 (短線)", expanded=True):
     d_min_vol = st.number_input("隔日沖最小量 (張)", value=1000, step=500)
 
 st.sidebar.divider()
-max_workers_input = st.sidebar.slider("策略運算效能 (執行緒數)", 1, 32, 16) # 加大預設值，因為現在只剩運算是瓶頸
+max_workers_input = st.sidebar.slider("策略運算效能 (執行緒數)", 1, 32, 16)
 
 params = {
     's_ma_trend': s_ma_trend, 's_use_year': s_use_year, 
@@ -559,26 +499,20 @@ if start_scan:
     day_candidates = []
     failed_list = []
 
-    # 1️⃣ 階段一：批量下載歷史資料 (I/O Bound)
     status_text.text("🔄 正在批量下載歷史資料 (yfinance)...")
     history_data_store = fetch_data_batch(stock_map)
     
-    # 2️⃣ 階段二：批量更新即時盤 (若為當日) (I/O Bound)
     today_str = datetime.datetime.now().strftime('%Y-%m-%d')
     realtime_map = {}
     if analysis_date_str == today_str:
         status_text.text("⚡ 正在批量更新即時盤 (twstock)...")
         realtime_map = fetch_realtime_batch(list(history_data_store.keys()))
 
-    # 3️⃣ 階段三：資料合併與策略運算 (CPU Bound)
     status_text.text("🧠 正在進行策略運算...")
     progress_bar.progress(0)
     
-    # 準備合併後的 DataFrames
-    tasks_data = {} # code: df
-    
+    tasks_data = {} 
     for code, df in history_data_store.items():
-        # 如果有即時盤，進行合併
         if code in realtime_map and realtime_map[code]['latest_trade_price'] != '-':
             try:
                 rt = realtime_map[code]
@@ -587,7 +521,6 @@ if start_scan:
                     'Low': float(rt['low']), 'Close': float(rt['latest_trade_price']), 
                     'Volume': float(rt['accumulate_trade_volume']) * 1000
                 }, name=pd.Timestamp(today_str))
-                # 簡單去重：如果歷史資料最後一天已經是今天，就覆蓋；否則新增
                 if df.index[-1].strftime('%Y-%m-%d') == today_str:
                     df.iloc[-1] = new_row
                 else:
@@ -595,45 +528,31 @@ if start_scan:
             except: pass
         tasks_data[code] = df
 
-    # 使用執行緒池進行純策略運算
     total = len(tasks_data)
     done = 0
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers_input) as executor:
-        # 將準備好的 DF 直接傳入
         futures = {executor.submit(analyze_combined_strategy, code, stock_map[code], analysis_date_str, params, SECTOR_DB, df): code for code, df in tasks_data.items()}
-        
         for future in concurrent.futures.as_completed(futures):
             done += 1
             if done % 50 == 0 or done == total:
                 progress_bar.progress(done / total)
                 status_text.text(f"策略運算中: {done}/{total}")
-            
             res = future.result()
-            
             if isinstance(res, dict):
                 if res['sniper']:
                     typ, data = res['sniper']
                     if typ == "triggered": sniper_triggered.append(data)
                     elif typ == "new_setup": sniper_setup.append(data)
                     elif typ == "watching": sniper_watching.append(data)
-                
                 if res['day']:
                     day_candidates.append(res['day'])
             else:
                 current_code = futures[future]
                 stock_name = stock_map[current_code]['short_name']
-                reason = res if isinstance(res, str) else "未知錯誤"
-                failed_list.append(f"{current_code} {stock_name} : {reason}")
+                failed_list.append(f"{current_code} {stock_name} : {res}")
     
     progress_bar.progress(1.0)
-    # 計算未下載到的股票 (Total Scan - Processed)
-    all_scan_set = set(scan_codes)
-    processed_set = set(tasks_data.keys())
-    missing_codes = all_scan_set - processed_set
-    for c in missing_codes:
-        failed_list.append(f"{c} : 下載失敗/無資料")
-
     status_text.success(f"掃描完成！ (成功: {len(tasks_data)} / 失敗: {len(failed_list)})")
     
     st.session_state['scan_results'] = {
@@ -648,17 +567,16 @@ results = st.session_state['scan_results']
 
 with tab1:
     st.header("🟢 狙擊手波段策略")
-    st.caption(f"基準日: {analysis_date_str} | 策略：趨勢 + 實體長紅 + 型態確認 (強勢路徑 / 回檔路徑)")
+    st.caption(f"基準日: {analysis_date_str} | 策略：趨勢 + 實體長紅 + 型態確認 (防守點含 1% 誤差)")
     
     if results:
-        # 顯示失敗清單
         if 'failed_list' in results and results['failed_list']:
              with st.expander(f"⚠️ 掃描失敗/無資料清單 ({len(results['failed_list'])})"):
                 st.write(", ".join(results['failed_list']))
                 
         s_trig = results['sniper_triggered']
         trig_strong = [x for x in s_trig if "強勢突破" in x['狀態']]
-        trig_n = [x for x in s_trig if "N字" in x['狀態']] # 包含 N字突破 和 N字跳空
+        trig_n = [x for x in s_trig if "N字" in x['狀態']]
         
         s_watch = results['sniper_watching']
         watch_strong = [x for x in s_watch if "強勢整理" in x['狀態']]
@@ -669,70 +587,51 @@ with tab1:
             if trig_strong:
                 st.markdown(f"### 🚀 強勢突破 ({len(trig_strong)})") 
                 df = pd.DataFrame(trig_strong)
-                if 'sort_pct' in df.columns:
-                    df = df.sort_values(by='sort_pct', ascending=False).drop(columns=['sort_pct'])
+                if 'sort_pct' in df.columns: df = df.sort_values(by='sort_pct', ascending=False).drop(columns=['sort_pct'])
                 display_full_table(df)
             if trig_n:
                 st.markdown(f"### 🎯 N字突破 ({len(trig_n)})")
                 df = pd.DataFrame(trig_n)
-                if 'sort_pct' in df.columns:
-                    df = df.sort_values(by='sort_pct', ascending=False).drop(columns=['sort_pct'])
+                if 'sort_pct' in df.columns: df = df.sort_values(by='sort_pct', ascending=False).drop(columns=['sort_pct'])
                 display_full_table(df)
         
         if results['sniper_setup'] or watch_strong or watch_pullback:
             if trig_strong or trig_n: st.divider()
             st.markdown("### 👀 市場潛力名單 (Monitoring)")
-            
             if results['sniper_setup']:
                 st.markdown(f"### 🔥 今日剛起漲 ({len(results['sniper_setup'])})")
                 df = pd.DataFrame(results['sniper_setup'])
-                if 'sort_pct' in df.columns:
-                    df = df.sort_values(by='sort_pct', ascending=False).drop(columns=['sort_pct'])
+                if 'sort_pct' in df.columns: df = df.sort_values(by='sort_pct', ascending=False).drop(columns=['sort_pct'])
                 display_full_table(df)
-            
             if watch_strong:
                 st.markdown(f"### 💪 強勢整理 ({len(watch_strong)})")
                 df = pd.DataFrame(watch_strong)
-                if 'sort_pct' in df.columns:
-                    df = df.sort_values(by='sort_pct', ascending=False).drop(columns=['sort_pct'])
+                if 'sort_pct' in df.columns: df = df.sort_values(by='sort_pct', ascending=False).drop(columns=['sort_pct'])
                 display_full_table(df)
-            
             if watch_pullback:
                 st.markdown(f"### 📉 回檔整理 ({len(watch_pullback)})")
                 df = pd.DataFrame(watch_pullback)
-                if 'sort_pct' in df.columns:
-                    df = df.sort_values(by='sort_pct', ascending=False).drop(columns=['sort_pct'])
+                if 'sort_pct' in df.columns: df = df.sort_values(by='sort_pct', ascending=False).drop(columns=['sort_pct'])
                 display_full_table(df)
-        
-        if not (s_trig or results['sniper_setup'] or s_watch):
-            st.info("今日無符合狙擊手策略之標的。")
-    else:
-        st.info("👈 請點擊左側「開始全域掃描」按鈕。")
+    else: st.info("👈 請點擊左側「開始全域掃描」按鈕。")
 
 with tab2:
     st.header("⚡ 隔日沖雷達")
-    st.caption(f"基準日: {analysis_date_str} | 策略：蓄勢待發 + 強勢動能 (> {d_min_pct}%) + 未漲停")
-    
     if results:
         day_list = results['day_candidates']
         if day_list:
             df_day = pd.DataFrame(day_list)
             df_day['sort_val'] = df_day['距離高點'].str.rstrip('%').astype(float)
             df_day = df_day.sort_values(by='sort_val', ascending=False).drop(columns=['sort_val'])
-            
-            st.markdown(f"### ⚡ 蓄勢待發清單 ({len(day_list)})")
             display_full_table(df_day)
-        else:
-            st.info("今日無符合隔日沖策略之標的。")
-    else:
-        st.info("👈 請點擊左側「開始全域掃描」按鈕。")
+        else: st.info("今日無符合隔日沖策略之標的。")
+    else: st.info("👈 請點擊左側「開始全域掃描」按鈕。")
 
 with tab3:
     st.header("📊 個股 K 線診斷")
     col_in, col_btn = st.columns([3, 1])
     with col_in: stock_input = st.text_input("輸入代號", value="2330")
     with col_btn: diag_btn = st.button("診斷")
-    
     if diag_btn:
         try:
             symbol = f"{stock_input}.TW"
@@ -740,21 +639,16 @@ with tab3:
             if df is None:
                 symbol = f"{stock_input}.TWO"
                 df = get_stock_data_with_realtime(stock_input, symbol, analysis_date_str)
-            
             if df is not None:
                 df['MA_Trend'] = df['Close'].rolling(window=s_ma_trend).mean()
                 df['MA_Base'] = df['Close'].rolling(window=20).mean()
                 plot_df = df.tail(250)
-                
                 fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3])
                 fig.add_trace(go.Candlestick(x=plot_df.index, open=plot_df['Open'], high=plot_df['High'], low=plot_df['Low'], close=plot_df['Close'], name='K線'), row=1, col=1)
                 fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA_Trend'], line=dict(color='blue'), name=f'{s_ma_trend}MA'), row=1, col=1)
                 fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA_Base'], line=dict(color='orange'), name='20MA'), row=1, col=1)
                 fig.add_trace(go.Bar(x=plot_df.index, y=plot_df['Volume'], name='成交量'), row=2, col=1)
-                
                 fig.update_layout(xaxis_rangeslider_visible=False, height=600)
                 st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.error("查無資料")
-        except:
-            st.error("發生錯誤")
+            else: st.error("查無資料")
+        except: st.error("發生錯誤")
