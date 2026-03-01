@@ -1,5 +1,5 @@
 # ==========================================
-# 強勢股戰情室 V10
+# 強勢股戰情室 V11
 # V2: Bug修復 + 評分系統 + 大盤狀態 + 產業泡泡圖
 # V3: 長紅K回溯天數、均量基準、量能門檻可調
 # V4: 回測深度過濾
@@ -8,6 +8,7 @@
 # V7: 加入 10MA > 20MA > 60MA 多頭排列濾網
 # V8: 移除市場潛力名單
 # V10: 整合處置股策略（第二分頁）+ 底量濾網
+# V11: 修正處置股爬蟲 SSL 憑證驗證問題 (加上 verify=False 與關閉警告)
 # ==========================================
 import streamlit as st
 import yfinance as yf
@@ -24,6 +25,10 @@ import logging
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from backtesting import Backtest, Strategy
+
+# 加入這兩行來關閉 SSL 憑證警告
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ==========================================
 # 📋 日誌設定 (修改項目 6：改善錯誤處理)
@@ -58,7 +63,7 @@ warnings.filterwarnings("ignore")
 # ⚙️ 頁面設定
 # ==========================================
 st.set_page_config(
-    page_title="強勢股戰情室 V10",
+    page_title="強勢股戰情室 V11",
     page_icon="🔥",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -350,6 +355,49 @@ def fetch_realtime_batch(codes_list, chunk_size=50):
 # 📈 大盤狀態判斷
 # ==========================================
 @st.cache_data(ttl=300, show_spinner=False)
+def fetch_market_status(analysis_date_str):
+    """
+    下載加權指數，判斷大盤強弱
+    回傳 dict: { 'strong': bool, 'score': int(0~10), 'label': str }
+    """
+    try:
+        tw = yf.Ticker("^TWII")
+        df = tw.history(period="1y")
+        if df.empty or df.index.tz is not None:
+            df.index = df.index.tz_localize(None) if not df.empty else df.index
+        if df.empty:
+            return {'strong': True, 'score': 5, 'label': '無法取得大盤資料'}
+
+        df['DateStr'] = df.index.strftime('%Y-%m-%d')
+        if analysis_date_str not in df['DateStr'].values:
+            latest_idx = -1
+        else:
+            latest_idx = df.index.get_loc(pd.Timestamp(analysis_date_str))
+
+        close = df['Close']
+        ma20  = close.rolling(20).mean()
+        ma60  = close.rolling(60).mean()
+        c     = close.iloc[latest_idx]
+        m20   = ma20.iloc[latest_idx]
+        m60   = ma60.iloc[latest_idx]
+
+        score = 0
+        if c > m20:  score += 4
+        if c > m60:  score += 3
+        if m20 > m60: score += 3
+
+        if score >= 7:
+            label = "🟢 大盤強勢"
+        elif score >= 4:
+            label = "🟡 大盤偏弱"
+        else:
+            label = "🔴 大盤弱勢"
+
+        return {'strong': score >= 7, 'score': score, 'label': label,
+                'close': round(c, 0), 'ma20': round(m20, 0), 'ma60': round(m60, 0)}
+    except Exception as e:
+        logger.warning(f"fetch_market_status 錯誤: {e}")
+        return {'strong': True, 'score': 5, 'label': '大盤資料異常'}
 
 # ==========================================
 # 🎯 處置股策略模組
@@ -407,7 +455,10 @@ def fetch_disposal_stocks():
             'Referer': 'https://www.twse.com.tw/',
         }
         logger.warning(f"上市處置股查詢 URL: {url}")
-        res = requests.get(url, headers=headers, timeout=15)
+        
+        # V11 修改：加入 verify=False 略過 SSL 驗證
+        res = requests.get(url, headers=headers, timeout=15, verify=False)
+        
         logger.warning(f"上市處置股 HTTP status: {res.status_code}")
         data = res.json()
         logger.warning(f"上市處置股 stat:{data.get('stat')} total:{data.get('total')} count:{data.get('count')}")
@@ -474,7 +525,10 @@ def fetch_disposal_stocks():
                 'Accept': 'application/json, text/html, */*',
                 'Referer': 'https://www.tpex.org.tw/',
             }
-            res = requests.get(url, headers=headers, timeout=15)
+            
+            # V11 修改：加入 verify=False 略過 SSL 驗證
+            res = requests.get(url, headers=headers, timeout=15, verify=False)
+            
             res.encoding = 'utf-8'
 
             # JSON 格式
@@ -757,52 +811,6 @@ def show_disposal_table(data):
     show_cols = [c for c in col_map if c in df.columns]
     df = df[show_cols].rename(columns=col_map)
     st.dataframe(df, width='stretch', hide_index=True)
-
-
-
-def fetch_market_status(analysis_date_str):
-    """
-    下載加權指數，判斷大盤強弱
-    回傳 dict: { 'strong': bool, 'score': int(0~10), 'label': str }
-    """
-    try:
-        tw = yf.Ticker("^TWII")
-        df = tw.history(period="1y")
-        if df.empty or df.index.tz is not None:
-            df.index = df.index.tz_localize(None) if not df.empty else df.index
-        if df.empty:
-            return {'strong': True, 'score': 5, 'label': '無法取得大盤資料'}
-
-        df['DateStr'] = df.index.strftime('%Y-%m-%d')
-        if analysis_date_str not in df['DateStr'].values:
-            latest_idx = -1
-        else:
-            latest_idx = df.index.get_loc(pd.Timestamp(analysis_date_str))
-
-        close = df['Close']
-        ma20  = close.rolling(20).mean()
-        ma60  = close.rolling(60).mean()
-        c     = close.iloc[latest_idx]
-        m20   = ma20.iloc[latest_idx]
-        m60   = ma60.iloc[latest_idx]
-
-        score = 0
-        if c > m20:  score += 4
-        if c > m60:  score += 3
-        if m20 > m60: score += 3
-
-        if score >= 7:
-            label = "🟢 大盤強勢"
-        elif score >= 4:
-            label = "🟡 大盤偏弱"
-        else:
-            label = "🔴 大盤弱勢"
-
-        return {'strong': score >= 7, 'score': score, 'label': label,
-                'close': round(c, 0), 'ma20': round(m20, 0), 'ma60': round(m60, 0)}
-    except Exception as e:
-        logger.warning(f"fetch_market_status 錯誤: {e}")
-        return {'strong': True, 'score': 5, 'label': '大盤資料異常'}
 
 
 # ==========================================
@@ -1336,7 +1344,7 @@ def run_backtest_ui(df, stock_input, params):
 # ==========================================
 # 🖥️ 介面主程式
 # ==========================================
-st.sidebar.title("🔥 強勢股戰情室 V10")
+st.sidebar.title("🔥 強勢股戰情室 V11")
 st.sidebar.caption("波段與短線的極致整合")
 
 # 修改項目 2：顯示目前快取模式
