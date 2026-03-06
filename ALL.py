@@ -587,25 +587,91 @@ def fetch_data_batch(stock_map, period="300d", chunk_size=150):
     return data_store
 
 def fetch_realtime_batch(codes_list, chunk_size=50):
+    """
+    即時報價批量取得。
+    優先用證交所/櫃買 STOCK_DAY_ALL API（一次回傳全部，極速）。
+    若 API 失敗才 fallback 到 twstock（逐批，較慢）。
+    """
     realtime_data = {}
     progress_text = st.empty()
 
-    for i in range(0, len(codes_list), chunk_size):
-        chunk = codes_list[i:i + chunk_size]
-        progress_text.text(f"⚡ 正在批量更新即時盤... ({i}/{len(codes_list)})")
-        try:
-            stocks = twstock.realtime.get(chunk)
-            if stocks:
-                if 'success' in stocks:
-                    if stocks['success']:
-                        realtime_data[stocks['info']['code']] = stocks['realtime']
-                else:
-                    for code, data in stocks.items():
-                        if data['success']:
-                            realtime_data[code] = data['realtime']
-            time.sleep(0.5)
-        except Exception as e:
-            logger.warning(f"fetch_realtime_batch 錯誤 (offset {i}): {e}")
+    # ── 方案A：證交所 STOCK_DAY_ALL（上市，一次全拿）──
+    try:
+        progress_text.text("⚡ 取得即時報價（證交所）...")
+        import urllib.request, json as _json
+        twse_url = "https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL?response=json"
+        req = urllib.request.Request(twse_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            d = _json.loads(r.read())
+        if d.get("stat") == "OK" and d.get("data"):
+            # fields: 證券代號,證券名稱,成交股數,成交金額,開盤價,最高價,最低價,收盤價,漲跌價差,成交筆數
+            fields = d["fields"]
+            fi = {f: i for i, f in enumerate(fields)}
+            for row in d["data"]:
+                try:
+                    c = row[fi["證券代號"]].strip()
+                    def _n(s):
+                        return float(str(s).replace(",","").replace("+","").replace("--","0")) if str(s) not in ("--","") else 0.0
+                    realtime_data[c] = {
+                        "latest_trade_price": str(_n(row[fi["收盤價"]])),
+                        "open":   str(_n(row[fi["開盤價"]])),
+                        "high":   str(_n(row[fi["最高價"]])),
+                        "low":    str(_n(row[fi["最低價"]])),
+                        "accumulate_trade_volume": str(int(_n(row[fi["成交股數"]]) / 1000)),
+                    }
+                except Exception:
+                    continue
+        logger.info(f"證交所即時報價取得 {len(realtime_data)} 筆")
+    except Exception as e:
+        logger.warning(f"證交所 STOCK_DAY_ALL 失敗: {e}，改用 twstock")
+
+    # ── 方案B：櫃買中心（上櫃，一次全拿）──
+    try:
+        progress_text.text("⚡ 取得即時報價（櫃買中心）...")
+        import urllib.request, json as _json
+        tpex_url = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes"
+        req = urllib.request.Request(tpex_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            rows = _json.loads(r.read())
+        for row in rows:
+            try:
+                c = str(row.get("SecuritiesCompanyCode","")).strip()
+                def _n2(s):
+                    return float(str(s).replace(",","")) if str(s) not in ("--","","N/A") else 0.0
+                realtime_data[c] = {
+                    "latest_trade_price": str(_n2(row.get("Close","0"))),
+                    "open":   str(_n2(row.get("Open","0"))),
+                    "high":   str(_n2(row.get("High","0"))),
+                    "low":    str(_n2(row.get("Low","0"))),
+                    "accumulate_trade_volume": str(int(_n2(row.get("TradeVolume","0")) / 1000)),
+                }
+            except Exception:
+                continue
+        logger.info(f"櫃買即時報價合計 {len(realtime_data)} 筆")
+    except Exception as e:
+        logger.warning(f"櫃買 tpex_mainboard_quotes 失敗: {e}")
+
+    # ── 方案C：若兩個 API 都失敗，才 fallback twstock（逐批）──
+    if not realtime_data:
+        logger.warning("即時 API 全部失敗，fallback 到 twstock（速度較慢）")
+        codes_needed = [c for c in codes_list if c not in realtime_data]
+        for i in range(0, len(codes_needed), chunk_size):
+            chunk = codes_needed[i:i + chunk_size]
+            progress_text.text(f"⚡ twstock fallback... ({i}/{len(codes_needed)})")
+            try:
+                stocks = twstock.realtime.get(chunk)
+                if stocks:
+                    if 'success' in stocks:
+                        if stocks['success']:
+                            realtime_data[stocks['info']['code']] = stocks['realtime']
+                    else:
+                        for code, data in stocks.items():
+                            if isinstance(data, dict) and data.get('success'):
+                                realtime_data[code] = data['realtime']
+                time.sleep(0.3)
+            except Exception as e:
+                logger.warning(f"twstock fallback 錯誤: {e}")
+
     progress_text.empty()
     return realtime_data
 
@@ -1506,6 +1572,14 @@ with st.sidebar.expander("🎯 處置股策略參數", expanded=True):
     d_vol_filter = st.checkbox("啟用底量濾網", value=True)
     d_min_vol_disp = st.number_input("底量門檻（張）", min_value=0, max_value=10000, value=1000, step=100, disabled=not d_vol_filter)
 
+# BULL GSheet 狀態（expander 外，永遠可見）
+if bull_use_gsheet():
+    st.sidebar.success("🟢 BULL 持倉已連線 Google Sheets")
+elif GSPREAD_AVAILABLE:
+    st.sidebar.warning("⚠️ BULL 持倉：未設定 Sheets Secrets")
+else:
+    st.sidebar.info("ℹ️ BULL 持倉：暫存模式（未安裝 gspread）")
+
 with st.sidebar.expander("🐂 BULL_v7 布林滾雪球參數", expanded=False):
     b_boll_period  = st.number_input("布林週期", value=15, min_value=5, max_value=60, key="b_bp")
     b_boll_std     = st.number_input("布林標準差", value=2.1, min_value=1.0, max_value=3.0, step=0.1, key="b_bs")
@@ -1515,12 +1589,13 @@ with st.sidebar.expander("🐂 BULL_v7 布林滾雪球參數", expanded=False):
     b_sma_days     = st.number_input("中軌趨勢天數", value=3, min_value=1, max_value=10, key="b_sd")
     b_min_vol      = st.number_input("20日均量門檻(張)", value=1000, min_value=100, step=100, key="b_mv") * 1000
     b_addon_b_pct  = st.number_input("加碼B門檻(%)", value=10, min_value=1, max_value=50, key="b_ab") / 100
-
-# BULL GSheet 狀態
-if bull_use_gsheet():
-    st.sidebar.success("🟢 BULL 持倉已連線 Google Sheets")
-elif GSPREAD_AVAILABLE:
-    st.sidebar.caption("⚠️ BULL：未設定 Sheets Secrets，使用暫存模式")
+    st.markdown("---")
+    if bull_use_gsheet():
+        st.success("🟢 持倉已連線 Google Sheets")
+    elif GSPREAD_AVAILABLE:
+        st.warning("⚠️ 未設定 Sheets Secrets，使用暫存模式")
+    else:
+        st.info("ℹ️ 未安裝 gspread，使用暫存模式")
 
 with st.sidebar.expander("⚡ 隔日沖策略參數 (短線)", expanded=True):
     d_period = st.slider("追蹤波段天數 (N)", 10, 120, 60, 5)
