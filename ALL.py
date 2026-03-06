@@ -1,5 +1,5 @@
 # ==========================================
-# 強勢股戰情室 V11
+# 強勢股戰情室 V12
 # V2: Bug修復 + 評分系統 + 大盤狀態 + 產業泡泡圖
 # V3: 長紅K回溯天數、均量基準、量能門檻可調
 # V4: 回測深度過濾
@@ -9,6 +9,7 @@
 # V8: 移除市場潛力名單
 # V10: 整合處置股策略（第二分頁）+ 底量濾網
 # V11: 修正處置股爬蟲 SSL 憑證驗證問題 (加上 verify=False 與關閉警告)
+# V12: 整合處置股掃描按鈕至左側欄，與主策略一鍵執行；修改狙擊手量能預設值為0.7倍
 # ==========================================
 import streamlit as st
 import yfinance as yf
@@ -31,7 +32,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ==========================================
-# 📋 日誌設定 (修改項目 6：改善錯誤處理)
+# 📋 日誌設定
 # ==========================================
 logging.basicConfig(
     level=logging.WARNING,
@@ -63,7 +64,7 @@ warnings.filterwarnings("ignore")
 # ⚙️ 頁面設定
 # ==========================================
 st.set_page_config(
-    page_title="強勢股戰情室 V11",
+    page_title="強勢股戰情室 V12",
     page_icon="🔥",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -75,6 +76,14 @@ except ImportError:
     st.error("❌ 缺少 `twstock` 套件，請輸入 `pip install twstock` 安裝")
     st.stop()
 
+# Google Sheets（可選）
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+    GSPREAD_AVAILABLE = True
+except ImportError:
+    GSPREAD_AVAILABLE = False
+
 st.markdown("""
 <style>
     .stDataFrame {font-size: 1.1rem;}
@@ -83,7 +92,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 🕐 交易時段判斷 (修改項目 2：動態快取)
+# 🕐 交易時段判斷
 # ==========================================
 def is_trading_hours():
     """判斷目前是否在台股交易時段 (09:00~13:30)"""
@@ -95,11 +104,6 @@ def is_trading_hours():
     return market_open <= now <= market_close
 
 def get_cache_ttl():
-    """
-    動態決定快取時間：
-    - 交易時段中：300秒 (5分鐘)，讓資料更新更頻繁
-    - 盤後/盤前：3600秒 (1小時)，節省流量
-    """
     return 300 if is_trading_hours() else 3600
 
 # ==========================================
@@ -229,7 +233,6 @@ def get_stock_info_map():
         logger.error(f"get_stock_info_map 錯誤: {e}")
         return {}
 
-# 修改項目 2：動態 TTL 快取，交易時段 5 分鐘，盤後 1 小時
 @st.cache_data(ttl=get_cache_ttl(), show_spinner=False)
 def fetch_history_data(symbol, start_date=None, end_date=None, period="2y"):
     try:
@@ -269,6 +272,261 @@ def get_stock_data_with_realtime(code, symbol, analysis_date_str):
         except Exception as e:
             logger.warning(f"get_stock_data_with_realtime 即時資料錯誤 [{code}]: {e}")
     return df
+
+# ==========================================
+# 🐂 BULL_v7 Google Sheets 持倉同步
+# ==========================================
+BULL_SHEET_COLS = ["symbol","name","進場日期","進場價","上次加碼價","持倉最高價","加碼次數","加碼紀錄"]
+BULL_SCOPES     = ["https://www.googleapis.com/auth/spreadsheets"]
+
+def bull_use_gsheet() -> bool:
+    if not GSPREAD_AVAILABLE:
+        return False
+    try:
+        return ("gcp_service_account" in st.secrets and "sheets" in st.secrets)
+    except Exception:
+        return False
+
+def bull_get_ws():
+    """取得 BULL 持倉的 worksheet"""
+    if not GSPREAD_AVAILABLE:
+        return None
+    try:
+        creds = Credentials.from_service_account_info(
+            st.secrets["gcp_service_account"], scopes=BULL_SCOPES)
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_key(st.secrets["sheets"]["sheet_id"])
+        try:
+            ws = sh.worksheet("bull_positions")
+        except Exception:
+            ws = sh.add_worksheet(title="bull_positions", rows=1000, cols=20)
+            ws.append_row(BULL_SHEET_COLS)
+        return ws
+    except Exception as e:
+        logger.warning(f"bull_get_ws 失敗: {e}")
+        return None
+
+def bull_gs_load() -> pd.DataFrame:
+    ws = bull_get_ws()
+    if ws is None:
+        return pd.DataFrame(columns=BULL_SHEET_COLS)
+    try:
+        data = ws.get_all_records()
+        if not data:
+            return pd.DataFrame(columns=BULL_SHEET_COLS)
+        df = pd.DataFrame(data)
+        df["加碼次數"]  = pd.to_numeric(df["加碼次數"],  errors="coerce").fillna(0).astype(int)
+        df["進場價"]    = pd.to_numeric(df["進場價"],    errors="coerce").fillna(0)
+        df["上次加碼價"]= pd.to_numeric(df["上次加碼價"],errors="coerce").fillna(0)
+        df["持倉最高價"]= pd.to_numeric(df["持倉最高價"],errors="coerce").fillna(0)
+        return df[BULL_SHEET_COLS]
+    except Exception:
+        return pd.DataFrame(columns=BULL_SHEET_COLS)
+
+def bull_gs_save(df: pd.DataFrame):
+    ws = bull_get_ws()
+    if ws is None:
+        return
+    try:
+        ws.clear()
+        ws.append_row(BULL_SHEET_COLS)
+        if len(df) > 0:
+            rows = df[BULL_SHEET_COLS].fillna("").values.tolist()
+            ws.append_rows(rows, value_input_option="USER_ENTERED")
+    except Exception as e:
+        logger.warning(f"bull_gs_save 失敗: {e}")
+
+
+# ==========================================
+# 🐂 BULL_v7 布林滾雪球策略（掃描器用）
+# ==========================================
+BULL_PARAMS = {
+    "boll_period"    : 15,
+    "boll_std"       : 2.1,
+    "squeeze_n"      : 15,
+    "squeeze_lookback": 5,
+    "vol_ma_days"    : 5,
+    "vol_ratio"      : 1.5,
+    "sma_trend_days" : 3,
+    "min_vol_shares" : 1_000_000,
+    "vol_ma20_days"  : 20,
+    "vol_heavy_days" : 5,
+    "vol_shrink_days": 15,
+    "init_position"  : 0.5,
+    "add_position"   : 0.5,
+    "addon_b_profit" : 0.10,
+}
+
+def bull_calc_indicators(df, params):
+    """計算 BULL_v7 所需指標"""
+    df = df.copy()
+    # 統一欄位名稱
+    df.columns = [c.capitalize() for c in df.columns]
+    needed = [c for c in ['Open','High','Low','Close','Volume'] if c in df.columns]
+    df = df[needed].copy()
+
+    close  = df["Close"]
+    volume = df["Volume"]
+    bp     = params["boll_period"]
+
+    df["SMA"]        = close.rolling(bp).mean()
+    df["Std"]        = close.rolling(bp).std()
+    df["Upper"]      = df["SMA"] + df["Std"] * params["boll_std"]
+    df["Lower"]      = df["SMA"] - df["Std"] * params["boll_std"]
+    df["Bandwidth"]  = df["Upper"] - df["Lower"]
+    df["Vol_MA"]     = volume.rolling(params["vol_ma_days"]).mean()
+
+    sq_n = params["squeeze_n"]
+    df["BW_Min"]         = df["Bandwidth"].rolling(sq_n).min()
+    df["Is_Squeeze"]     = df["Bandwidth"] == df["BW_Min"]
+    lb = params["squeeze_lookback"]
+    df["Squeeze_Recent"] = df["Is_Squeeze"].shift(1).rolling(lb).max() == 1
+
+    df["SMA_Up"]     = df["SMA"] > df["SMA"].shift(params["sma_trend_days"])
+    df["Vol_MA20"]   = volume.rolling(params["vol_ma20_days"]).mean()
+    df["Vol_Heavy"]  = volume.rolling(params["vol_heavy_days"]).mean()
+    df["Vol_Shrink"] = volume.rolling(params["vol_shrink_days"]).mean()
+
+    return df
+
+
+def bull_check_entry(df, params):
+    """今日是否符合 BULL_v7 進場條件"""
+    if len(df) < params["boll_period"] + params["squeeze_n"]:
+        return False
+    r = df.iloc[-1]
+    if pd.isna(r["Squeeze_Recent"]) or pd.isna(r["Vol_MA20"]):
+        return False
+    squeeze  = bool(r["Squeeze_Recent"])
+    sma_up   = bool(r["SMA_Up"])
+    breakout = float(r["Close"]) > float(r["Upper"])
+    vol_ok   = float(r["Volume"]) > float(r["Vol_MA"]) * params["vol_ratio"]
+    min_vol  = float(r["Vol_MA20"]) > params["min_vol_shares"]
+    return squeeze and sma_up and breakout and vol_ok and min_vol
+
+
+def bull_scan_one(code, info, df_raw, params, pos_map, scan_date_ts):
+    """掃描單支股票，回傳進場/加碼A/加碼B/出場訊號"""
+    result = {"entry": None, "addon_a": None, "addon_b": None, "exit": None, "high_update": None}
+    try:
+        df = bull_calc_indicators(df_raw, params)
+        # 依掃描日期截斷
+        df = df[df.index <= scan_date_ts]
+        if len(df) < 50:
+            return result
+
+        sym    = info["symbol"]
+        name   = info["short_name"]
+        r      = df.iloc[-1]
+        r1     = df.iloc[-2]
+        c      = float(r["Close"])
+        sma_i  = float(r["SMA"])
+        lo_i   = float(r["Lower"])
+        l_i    = float(r["Low"])
+        vol_i  = float(r["Volume"])
+        vheavy = float(r["Vol_Heavy"]) if not pd.isna(r["Vol_Heavy"]) else 0
+
+        in_pos = sym in pos_map
+
+        if not in_pos:
+            # 進場訊號
+            if bull_check_entry(df, params):
+                result["entry"] = {
+                    "代號": code, "名稱": name, "symbol": sym,
+                    "收盤價": round(c, 2),
+                    "上軌": round(float(r["Upper"]), 2),
+                    "15MA": round(sma_i, 2),
+                    "成交量": int(vol_i),
+                    "5MA量": int(r["Vol_MA"]) if not pd.isna(r["Vol_MA"]) else 0,
+                }
+        else:
+            pos = pos_map[sym]
+            entry_price      = float(pos["進場價"])
+            last_addon_price = float(pos["上次加碼價"])
+            peak_price       = float(pos["持倉最高價"])
+
+            # 更新最高價
+            if c > peak_price:
+                result["high_update"] = (sym, round(c, 2))
+
+            # 出場優先：出量跌破15MA 或 最低碰下軌
+            heavy_break = (c < sma_i) and (vol_i >= vheavy) and vheavy > 0
+            low_break   = l_i <= lo_i
+            if heavy_break or low_break:
+                reason = "出量跌破15MA" if heavy_break else "最低碰下軌"
+                result["exit"] = {
+                    "代號": code, "名稱": name, "symbol": sym,
+                    "收盤價": round(c, 2), "15MA": round(sma_i, 2),
+                    "進場價": round(entry_price, 2),
+                    "損益%": round((c - entry_price) / entry_price * 100, 2),
+                    "加碼次數": int(pos.get("加碼次數", 0)),
+                    "出場原因": reason,
+                }
+                return result
+
+            # 加碼A：昨日量縮跌破15MA，今日站回
+            vshrink = float(r1["Vol_Shrink"]) if not pd.isna(r1["Vol_Shrink"]) else 0
+            y_below   = float(r1["Close"]) < float(r1["SMA"])
+            y_vol_low = float(r1["Volume"]) < vshrink if vshrink > 0 else False
+            if y_below and y_vol_low and c >= sma_i:
+                result["addon_a"] = {
+                    "代號": code, "名稱": name, "symbol": sym,
+                    "收盤價": round(c, 2), "15MA": round(sma_i, 2),
+                    "加碼次數": int(pos.get("加碼次數", 0)),
+                    "加碼類型": "A 回測站回",
+                }
+
+            # 加碼B：突破持倉最高價 且 距上次加碼>=10%
+            profit_from_last = (c - last_addon_price) / last_addon_price if last_addon_price > 0 else 0
+            if c > peak_price and profit_from_last >= params["addon_b_profit"]:
+                result["addon_b"] = {
+                    "代號": code, "名稱": name, "symbol": sym,
+                    "收盤價": round(c, 2),
+                    "持倉最高價": round(peak_price, 2),
+                    "距上次加碼": f"+{profit_from_last*100:.1f}%",
+                    "加碼次數": int(pos.get("加碼次數", 0)),
+                    "加碼類型": "B 突破新高",
+                }
+    except Exception as e:
+        logger.warning(f"bull_scan_one 錯誤 [{code}]: {e}")
+    return result
+
+
+def bull_run_scan(stock_map, all_data, scan_date_str, bull_positions, bull_params, max_workers=16):
+    """執行 BULL_v7 全市場掃描"""
+    scan_date_ts = pd.Timestamp(scan_date_str)
+    pos_map = {row["symbol"]: row for _, row in bull_positions.iterrows()} if len(bull_positions) > 0 else {}
+
+    entry_list  = []
+    addon_a_list = []
+    addon_b_list = []
+    exit_list   = []
+    high_updates = []
+
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {}
+        for code, df_raw in all_data.items():
+            if code not in stock_map:
+                continue
+            info = stock_map[code]
+            sym  = info["symbol"]
+            futures[executor.submit(bull_scan_one, code, info, df_raw, bull_params, pos_map, scan_date_ts)] = code
+
+        for future in concurrent.futures.as_completed(futures):
+            res = future.result()
+            if res["entry"]     : entry_list.append(res["entry"])
+            if res["addon_a"]   : addon_a_list.append(res["addon_a"])
+            if res["addon_b"]   : addon_b_list.append(res["addon_b"])
+            if res["exit"]      : exit_list.append(res["exit"])
+            if res["high_update"]: high_updates.append(res["high_update"])
+
+    return {
+        "entry": entry_list, "addon_a": addon_a_list,
+        "addon_b": addon_b_list, "exit": exit_list,
+        "high_updates": high_updates
+    }
+
 
 # ==========================================
 # 🚀 批量下載加速模組
@@ -356,10 +614,6 @@ def fetch_realtime_batch(codes_list, chunk_size=50):
 # ==========================================
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_market_status(analysis_date_str):
-    """
-    下載加權指數，判斷大盤強弱
-    回傳 dict: { 'strong': bool, 'score': int(0~10), 'label': str }
-    """
     try:
         tw = yf.Ticker("^TWII")
         df = tw.history(period="1y")
@@ -403,29 +657,17 @@ def fetch_market_status(analysis_date_str):
 # 🎯 處置股策略模組
 # ==========================================
 def is_valid_stock_code(code):
-    """
-    只接受一般股票代號：
-    - 上市：4碼純數字，不含可轉債(第5碼起有字母)
-    - 上櫃：4碼純數字，1開頭到8開頭，排除衍生商品
-    可轉債代號通常 > 9000 或包含字母
-    """
     if not code or not code.isdigit():
         return False
     if len(code) != 4:
         return False
     num = int(code)
-    # 排除可轉債（通常 > 9000）、ETF受益憑證等特殊代號
     if num >= 9000:
         return False
     return True
 
-
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_disposal_stocks():
-    """
-    從證交所與櫃買中心爬取當前處置股清單
-    回傳 dict: { code: { 'name', 'start', 'end', 'market', 'symbol' } }
-    """
     disposal = {}
 
     def roc_to_date(s):
@@ -436,13 +678,10 @@ def fetch_disposal_stocks():
         d = int(parts[2].strip())
         return datetime.date(y, m, d)
 
-    # --- 上市（證交所）---
-    # 格式：row[2]=代號, row[3]=名稱, row[6]='115/03/02～115/03/13'（全形波浪號）
     try:
         today_dt = datetime.date.today()
         start_query = today_dt - datetime.timedelta(days=30)
         end_query   = today_dt + datetime.timedelta(days=30)
-        # 證交所使用西元年 YYYYMMDD 格式
         url = (
             f"https://www.twse.com.tw/rwd/zh/announcement/punish"
             f"?response=json"
@@ -454,45 +693,31 @@ def fetch_disposal_stocks():
             'Accept': 'application/json, */*',
             'Referer': 'https://www.twse.com.tw/',
         }
-        logger.warning(f"上市處置股查詢 URL: {url}")
-        
-        # V11 修改：加入 verify=False 略過 SSL 驗證
         res = requests.get(url, headers=headers, timeout=15, verify=False)
-        
-        logger.warning(f"上市處置股 HTTP status: {res.status_code}")
         data = res.json()
-        logger.warning(f"上市處置股 stat:{data.get('stat')} total:{data.get('total')} count:{data.get('count')}")
 
         if data.get('stat') == 'OK':
             twse_temp = {}
-            total_rows = len(data.get('data', []))
-            logger.warning(f"上市處置股 API 回傳 {total_rows} 筆 | title:{data.get('title','')} | total:{data.get('total','')}")
             for row in data.get('data', []):
                 try:
                     code = str(row[2]).strip()
                     name = str(row[3]).strip()
                     period_str = str(row[6]).strip()
 
-                    # 支援全形 ～ 和半形 ~ 兩種分隔符
                     if '～' in period_str:
                         parts = period_str.split('～')
                     elif '~' in period_str:
                         parts = period_str.split('~')
                     else:
-                        logger.warning(f"上市 {code} 日期格式無法解析: {period_str}")
                         continue
 
                     start_dt = roc_to_date(parts[0].strip())
                     end_dt   = roc_to_date(parts[1].strip())
 
-                    # 只保留每5分鐘撮合的處置股
-                    # 上市：row[7]=處置措施 row[8]=處置內容，兩個都檢查
                     disposal_content = ''
                     if len(row) > 7: disposal_content += str(row[7])
                     if len(row) > 8: disposal_content += str(row[8])
                     is_5min = '每五分鐘' in disposal_content or '每5分鐘' in disposal_content
-
-                    logger.warning(f"上市 {code} {name} | 期間:{period_str} | 5min:{is_5min} | valid:{is_valid_stock_code(code)}")
 
                     if is_valid_stock_code(code) and is_5min:
                         if code not in twse_temp or end_dt > twse_temp[code]['end']:
@@ -505,15 +730,11 @@ def fetch_disposal_stocks():
                                 'match_type': '5分鐘撮合'
                             }
                 except Exception as e:
-                    logger.warning(f"上市處置股解析錯誤: {row} -> {e}")
-            logger.warning(f"上市處置股篩選後 {len(twse_temp)} 筆")
+                    pass
             disposal.update(twse_temp)
-        else:
-            st.warning(f"⚠️ 上市處置股查詢異常: {data.get('stat')}")
     except Exception as e:
-        st.warning(f"⚠️ 無法取得上市處置股清單: {e}")
+        logger.warning(f"上市處置股查詢異常: {e}")
 
-    # --- 上櫃（櫃買中心）---
     tpex_urls = [
         "https://www.tpex.org.tw/web/stock/aftertrading/disposal_stock/dispost_result.php?l=zh-tw",
         "https://www.tpex.org.tw/openapi/v1/tpex_disposal_information",
@@ -525,13 +746,9 @@ def fetch_disposal_stocks():
                 'Accept': 'application/json, text/html, */*',
                 'Referer': 'https://www.tpex.org.tw/',
             }
-            
-            # V11 修改：加入 verify=False 略過 SSL 驗證
             res = requests.get(url, headers=headers, timeout=15, verify=False)
-            
             res.encoding = 'utf-8'
 
-            # JSON 格式
             if res.headers.get('content-type','').startswith('application/json') or res.text.strip().startswith('['):
                 rows = res.json()
                 if isinstance(rows, list):
@@ -539,14 +756,11 @@ def fetch_disposal_stocks():
                         try:
                             code = str(row.get('SecuritiesCompanyCode', row.get('code',''))).strip()
                             name = str(row.get('CompanyName', row.get('name',''))).strip()
-
-                            # 處理 DispositionPeriod 格式：'1150204~1150226'
                             period = str(row.get('DispositionPeriod', '')).strip()
                             if '~' in period:
                                 parts = period.split('~')
-                                start_s = parts[0].strip()  # '1150204'
-                                end_s   = parts[1].strip()  # '1150226'
-                                # 格式轉換：1150204 → 民國115年02月04日
+                                start_s = parts[0].strip()
+                                end_s   = parts[1].strip()
                                 def roc8_to_date(s):
                                     s = s.strip()
                                     y = int(s[0:3]) + 1911
@@ -556,13 +770,11 @@ def fetch_disposal_stocks():
                                 start_dt = roc8_to_date(start_s)
                                 end_dt   = roc8_to_date(end_s)
                             else:
-                                # 備用：嘗試獨立欄位
                                 start_s = str(row.get('DisposalStartDate', row.get('start',''))).strip()
                                 end_s   = str(row.get('DisposalEndDate',   row.get('end',''))).strip()
                                 start_dt = roc_to_date(start_s)
                                 end_dt   = roc_to_date(end_s)
 
-                            # 只保留每5分鐘撮合的處置股
                             disposal_content = str(row.get('DisposalCondition', row.get('DispositionReasons', '')))
                             is_5min = '每5分鐘' in disposal_content or '每五分鐘' in disposal_content
                             if is_valid_stock_code(code) and is_5min:
@@ -575,10 +787,9 @@ def fetch_disposal_stocks():
                                     'match_type': '5分鐘撮合'
                                 }
                         except Exception as e:
-                            logger.warning(f"上櫃處置股JSON解析錯誤: {row} -> {e}")
+                            pass
                     break
 
-            # HTML 格式
             soup = BeautifulSoup(res.text, 'html.parser')
             table = soup.find('table')
             if table:
@@ -597,20 +808,14 @@ def fetch_disposal_stocks():
                                     'symbol': f"{code}.TWO"
                                 }
                         except Exception as e:
-                            logger.warning(f"上櫃處置股HTML解析錯誤: {cols} -> {e}")
+                            pass
                 break
         except Exception as e:
-            logger.warning(f"上櫃處置股端點失敗 {url}: {e}")
             continue
 
     return disposal
 
-
 def analyze_disposal_stock(code, info, analysis_date, min_vol=0):
-    """
-    下載日K，執行進出場邏輯
-    回傳包含最新訊號狀態的 dict
-    """
     try:
         symbol = info['symbol']
         ticker = yf.Ticker(symbol)
@@ -622,7 +827,6 @@ def analyze_disposal_stock(code, info, analysis_date, min_vol=0):
         if df.index.tz is not None:
             df.index = df.index.tz_localize(None)
 
-        # 量能濾網
         if min_vol > 0:
             _s = pd.Timestamp(info['start'])
             _e = pd.Timestamp(analysis_date)
@@ -630,11 +834,9 @@ def analyze_disposal_stock(code, info, analysis_date, min_vol=0):
             if not _dv.empty and _dv['Volume'].min() < min_vol * 1000:
                 return None
 
-        # 計算 MA（用全部資料確保均線準確）
         df['ma5']  = df['Close'].rolling(5).mean()
         df['ma10'] = df['Close'].rolling(10).mean()
 
-        # 只保留處置期間到分析基準日的資料
         start_ts = pd.Timestamp(info['start'])
         end_ts   = pd.Timestamp(analysis_date)
         df_period = df[(df.index >= start_ts) & (df.index <= end_ts)].copy()
@@ -643,13 +845,9 @@ def analyze_disposal_stock(code, info, analysis_date, min_vol=0):
             return None
 
         analysis_date_str = analysis_date.strftime('%Y-%m-%d')
-
-        # ==========================================
-        # 掃描進出場訊號
-        # ==========================================
-        position = None   # 持倉資訊 { entry_date, entry_price }
-        trades   = []     # 完成的交易紀錄
-        latest_signal = None  # 最新狀態
+        position = None
+        trades   = []
+        latest_signal = None
 
         for i in range(1, len(df_period)):
             today      = df_period.index[i]
@@ -661,7 +859,6 @@ def analyze_disposal_stock(code, info, analysis_date, min_vol=0):
             pct_today  = (c_today - df_period['Close'].iloc[i-1]) / df_period['Close'].iloc[i-1] * 100
 
             if position is None:
-                # 沒有持倉 → 找進場訊號
                 if c_today > prev_high:
                     position = {
                         'entry_date':  today_str,
@@ -681,11 +878,9 @@ def analyze_disposal_stock(code, info, analysis_date, min_vol=0):
                         'signal_pct': f"{pct_today:+.2f}%",
                     }
             else:
-                # 有持倉 → 判斷出場條件
                 entry_price = position['entry_price']
                 profit_pct  = (c_today - entry_price) / entry_price * 100
 
-                # 決定用哪條 MA 出場
                 if profit_pct >= 15.0:
                     exit_ma    = ma5_today
                     exit_label = '5MA'
@@ -704,10 +899,9 @@ def analyze_disposal_stock(code, info, analysis_date, min_vol=0):
                         'profit_pct':  profit_pct,
                         'exit_reason': f"跌破{exit_label}",
                     })
-                    position = None  # 出場後重置
+                    position = None
                     latest_signal = None
                 else:
-                    # 更新持有中狀態
                     latest_signal = {
                         'status': '🟢 持有中',
                         'entry_date':  position['entry_date'],
@@ -722,26 +916,18 @@ def analyze_disposal_stock(code, info, analysis_date, min_vol=0):
                         'signal_pct': '-',
                     }
 
-        # ==========================================
-        # 整理回傳結果
-        # ==========================================
         today_date_str = analysis_date_str
-
-        # 判斷今天有沒有新進場訊號
         is_new_signal_today = (
             latest_signal is not None and
             latest_signal.get('entry_date') == today_date_str and
             latest_signal.get('status') == '🟢 持有中'
         )
 
-        # 有持倉或今天有訊號才回傳
         if latest_signal is None and not trades:
             return None
 
-        # 最近一筆已出場交易
         last_trade = trades[-1] if trades else None
 
-        # 目前狀態
         if latest_signal:
             status = latest_signal['status']
         elif last_trade:
@@ -749,7 +935,6 @@ def analyze_disposal_stock(code, info, analysis_date, min_vol=0):
         else:
             status = '-'
 
-        # 計算處置剩餘天數
         days_left = (info['end'] - analysis_date).days
 
         return {
@@ -761,27 +946,22 @@ def analyze_disposal_stock(code, info, analysis_date, min_vol=0):
             'days_left':        max(days_left, 0),
             'status':           status,
             'is_new_today':     is_new_signal_today,
-            # 進場資訊
             'entry_date':       latest_signal['entry_date'] if latest_signal else (last_trade['entry_date'] if last_trade else '-'),
             'entry_price':      latest_signal['entry_price'] if latest_signal else (f"{last_trade['entry_price']:.2f}" if last_trade else '-'),
-            # 出場資訊
             'exit_date':        latest_signal.get('exit_date', '-') if latest_signal else (last_trade['exit_date'] if last_trade else '-'),
             'exit_price':       latest_signal.get('exit_price', '-') if latest_signal else (f"{last_trade['exit_price']:.2f}" if last_trade else '-'),
             'profit_pct':       latest_signal.get('profit_pct', '-') if latest_signal else (f"{last_trade['profit_pct']:+.2f}%" if last_trade else '-'),
             'exit_reason':      latest_signal.get('exit_reason', '-') if latest_signal else (last_trade['exit_reason'] if last_trade else '-'),
-            # 訊號K棒資訊
             'signal_date':      latest_signal.get('signal_date', '-') if latest_signal else '-',
             'signal_close':     latest_signal.get('signal_close', '-') if latest_signal else '-',
             'signal_prev_high': latest_signal.get('signal_prev_high', '-') if latest_signal else '-',
             'signal_pct':       latest_signal.get('signal_pct', '-') if latest_signal else '-',
-            # 統計
             'total_trades':     len(trades),
         }
 
     except Exception as e:
         logger.warning(f"analyze_disposal_stock 錯誤 [{code}]: {e}")
         return None
-
 
 def show_disposal_table(data):
     if not data:
@@ -812,36 +992,24 @@ def show_disposal_table(data):
     df = df[show_cols].rename(columns=col_map)
     st.dataframe(df, width='stretch', hide_index=True)
 
-
 # ==========================================
 # 🏆 N字品質評分
 # ==========================================
 def calc_sniper_score(c_today, prev_h, defense_price, s_high, s_low, s_close,
                       setup_idx, idx, high, low, volume, op, market_score, pullback_depth=0):
-    """
-    評分維度（滿分100）：
-    1. 風險報酬比    35分
-    2. 量能品質      25分
-    3. 收盤強度      20分
-    4. 趨勢距離      15分
-    5. 大盤環境       5分
-    """
     score = 0
     details = {}
 
-    # --- 1. 風險距離 (35分) ---
-    # 風險距離 = (收盤 - 防守價) / 收盤，越小越好
     if c_today > 0:
         risk_pct = (c_today - defense_price) / c_today * 100
         details['風險距離'] = round(risk_pct, 1)
-        if risk_pct <= 3.0:   score += 35   # 極佳
-        elif risk_pct <= 5.0: score += 25   # 良好
-        elif risk_pct <= 8.0: score += 15   # 尚可
-        else:                 score += 0    # 風險距離過大
+        if risk_pct <= 3.0:   score += 35
+        elif risk_pct <= 5.0: score += 25
+        elif risk_pct <= 8.0: score += 15
+        else:                 score += 0
     else:
         details['風險距離'] = 0
 
-    # --- 2. 量能品質 (25分) ---
     if setup_idx > 0 and idx > setup_idx:
         consolidation_vol = volume.iloc[setup_idx:idx].mean()
         today_vol = volume.iloc[idx]
@@ -849,13 +1017,12 @@ def calc_sniper_score(c_today, prev_h, defense_price, s_high, s_low, s_close,
         details['量能倍數'] = round(vol_ratio, 1)
         if 2.0 <= vol_ratio <= 4.0:   score += 25
         elif 1.5 <= vol_ratio < 2.0:  score += 18
-        elif vol_ratio >= 4.0:        score += 12  # 量太大可能是出貨
+        elif vol_ratio >= 4.0:        score += 12
         elif vol_ratio >= 1.0:        score += 8
         else:                         score += 0
     else:
         details['量能倍數'] = 0
 
-    # --- 3. 收盤強度 (20分) ---
     h_today = high.iloc[idx]
     l_today = low.iloc[idx]
     candle_range = h_today - l_today
@@ -869,7 +1036,6 @@ def calc_sniper_score(c_today, prev_h, defense_price, s_high, s_low, s_close,
     else:
         details['收盤強度'] = 0
 
-    # --- 4. 整理振幅（越小越好）(15分) ---
     if setup_idx > 0:
         seg_high = high.iloc[setup_idx:idx].max()
         seg_low  = low.iloc[setup_idx:idx].min()
@@ -885,21 +1051,16 @@ def calc_sniper_score(c_today, prev_h, defense_price, s_high, s_low, s_close,
     else:
         details['整理振幅'] = 0
 
-    # --- 5. 回測深度 (加分項，最高+10）---
-    # 回測越淺代表籌碼越穩，給予額外加分
     details['回測深度'] = round(pullback_depth, 1)
-    if pullback_depth <= 20:    score += 10   # 極淺，籌碼鎖死
-    elif pullback_depth <= 38:  score += 7    # 黃金回測
-    elif pullback_depth <= 50:  score += 3    # 尚可
-    # > 50% 已被過濾，不會到這裡
+    if pullback_depth <= 20:    score += 10
+    elif pullback_depth <= 38:  score += 7
+    elif pullback_depth <= 50:  score += 3
 
-    # --- 6. 大盤環境 (5分) ---
     market_pts = round(market_score / 10 * 5)
     score += market_pts
     details['大盤分'] = market_pts
 
     return min(score, 100), details
-
 
 # ==========================================
 # 🧠 綜合分析引擎
@@ -932,14 +1093,13 @@ def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sect
         result_sniper = None
         result_day = None
 
-        # --- 策略 A: 狙擊手 ---
         s_ma_trend = params['s_ma_trend']
         s_use_year = params['s_use_year']
         s_big_candle = params['s_big_candle']
         s_min_vol = params['s_min_vol']
         s_setup_lookback = params.get('s_setup_lookback', 25)
         s_vol_ma_days = params.get('s_vol_ma_days', 20)
-        s_vol_ratio = params.get('s_vol_ratio', 0.8)
+        s_vol_ratio = params.get('s_vol_ratio', 0.7)
         s_pullback_max = params.get('s_pullback_max', 50)
 
         ma_t = close.rolling(window=s_ma_trend).mean()
@@ -947,14 +1107,13 @@ def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sect
         ma10 = close.rolling(window=10).mean()
         ma20 = close.rolling(window=20).mean()
         ma60 = close.rolling(window=60).mean()
-        vol_ma = volume.rolling(window=5).mean()          # 保留5日均量供其他用途
-        vol_ma_setup = volume.rolling(window=s_vol_ma_days).mean()  # 長紅K判斷用
+        vol_ma = volume.rolling(window=5).mean()
+        vol_ma_setup = volume.rolling(window=s_vol_ma_days).mean()
 
         is_sniper_candidate = True
         if volume.iloc[idx] < s_min_vol: is_sniper_candidate = False
         if s_use_year and len(ma_y) > idx and (pd.isna(ma_y.iloc[idx]) or close.iloc[idx] < ma_y.iloc[idx]): is_sniper_candidate = False
         if not (close.iloc[idx] > ma_t.iloc[idx] and ma_t.iloc[idx] > ma_t.iloc[idx-1]): is_sniper_candidate = False
-        # V7: 10MA > 20MA > 60MA 多頭排列
         if not (pd.notna(ma10.iloc[idx]) and pd.notna(ma20.iloc[idx]) and pd.notna(ma60.iloc[idx]) and
                 close.iloc[idx] > ma10.iloc[idx] > ma20.iloc[idx] > ma60.iloc[idx]): is_sniper_candidate = False
 
@@ -984,10 +1143,9 @@ def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sect
                     prev_open_setup = op.iloc[b_idx-1]
 
                     if s_low > prev_high_setup:
-                        # 跳空情況：用前一天實體上緣定義缺口下緣（排除上影線干擾）
-                        if prev_close_setup >= prev_open_setup:  # 前一天是紅K
+                        if prev_close_setup >= prev_open_setup:
                             base_val = prev_close_setup
-                        else:  # 前一天是黑K
+                        else:
                             base_val = prev_open_setup
                     else:
                         base_val = s_low
@@ -1007,13 +1165,10 @@ def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sect
                     if c_k < defense_price: is_broken = True; break
                     if c_k < s_high: dropped_below_high = True
 
-                # --- 回測深度過濾 ---
-                # 整理期間（長紅K隔天到突破前一天）收盤最低點
                 if setup_idx + 1 < idx:
                     consolidation_close_min = close.iloc[setup_idx + 1 : idx].min()
                 else:
                     consolidation_close_min = s_close
-                # 回測深度 = (長紅K收盤 - 整理期收盤最低) / 長紅K收盤
                 pullback_depth = (s_close - consolidation_close_min) / s_close * 100
                 is_pullback_ok = pullback_depth <= s_pullback_max
 
@@ -1102,7 +1257,6 @@ def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sect
                     "_signal_high": high.iloc[idx], "_signal_low": low.iloc[idx]
                 })
 
-        # --- 策略 B: 隔日沖 ---
         d_period = params['d_period']
         d_threshold = params['d_threshold']
         d_min_vol = params['d_min_vol']
@@ -1143,7 +1297,6 @@ def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sect
 # ==========================================
 def display_full_table(df):
     if df is not None and not df.empty:
-        # 過濾掉內部用的 _ 開頭欄位
         display_cols = [c for c in df.columns if not c.startswith('_')]
         display_df = df[display_cols]
         height = (len(display_df) * 35) + 38
@@ -1152,10 +1305,9 @@ def display_full_table(df):
         st.info("無")
 
 # ==========================================
-# 📊 個股診斷強化版 (修改項目 3：標記訊號 + 修改項目 4：回測整合)
+# 📊 個股診斷強化版
 # ==========================================
 def run_diagnosis(stock_input, analysis_date_str, params):
-    """執行個股診斷，回傳 (df, symbol, info_dict) 或 None"""
     symbol = f"{stock_input}.TW"
     df = get_stock_data_with_realtime(stock_input, symbol, analysis_date_str)
     if df is None:
@@ -1164,12 +1316,6 @@ def run_diagnosis(stock_input, analysis_date_str, params):
     return df, symbol
 
 def plot_diagnosis_chart(df, stock_input, analysis_date_str, params, sniper_info=None):
-    """
-    修改項目 3：強化個股診斷圖表
-    - 標記訊號日 (長紅K那天)
-    - 標記防守價位線
-    - 顯示策略狀態標籤
-    """
     s_ma_trend = params['s_ma_trend']
     df = df.copy()
     df['MA_Trend'] = df['Close'].rolling(window=s_ma_trend).mean()
@@ -1184,7 +1330,6 @@ def plot_diagnosis_chart(df, stock_input, analysis_date_str, params, sniper_info
         subplot_titles=("K線圖", "成交量")
     )
 
-    # K線
     fig.add_trace(go.Candlestick(
         x=plot_df.index,
         open=plot_df['Open'], high=plot_df['High'],
@@ -1192,7 +1337,6 @@ def plot_diagnosis_chart(df, stock_input, analysis_date_str, params, sniper_info
         name='K線', increasing_line_color='red', decreasing_line_color='green'
     ), row=1, col=1)
 
-    # 均線
     fig.add_trace(go.Scatter(
         x=plot_df.index, y=plot_df['MA_Trend'],
         line=dict(color='blue', width=1.5), name=f'{s_ma_trend}MA'
@@ -1207,14 +1351,12 @@ def plot_diagnosis_chart(df, stock_input, analysis_date_str, params, sniper_info
             line=dict(color='purple', width=1.2, dash='dash'), name='240MA'
         ), row=1, col=1)
 
-    # 修改項目 3：標記訊號日與防守價
     if sniper_info:
         setup_date = sniper_info.get('_setup_date')
         defense_price = sniper_info.get('_defense')
         signal_high = sniper_info.get('_signal_high')
         status = sniper_info.get('狀態', '')
 
-        # 標記訊號日垂直線
         if setup_date:
             try:
                 setup_ts = pd.Timestamp(setup_date)
@@ -1228,7 +1370,6 @@ def plot_diagnosis_chart(df, stock_input, analysis_date_str, params, sniper_info
             except Exception as e:
                 logger.warning(f"標記訊號日錯誤: {e}")
 
-        # 標記防守價水平線
         if defense_price and defense_price > 0:
             fig.add_hline(
                 y=defense_price,
@@ -1237,7 +1378,6 @@ def plot_diagnosis_chart(df, stock_input, analysis_date_str, params, sniper_info
                 annotation_position="bottom right"
             )
 
-        # 標記長紅K最高點
         if signal_high and signal_high > 0:
             fig.add_hline(
                 y=signal_high,
@@ -1246,7 +1386,6 @@ def plot_diagnosis_chart(df, stock_input, analysis_date_str, params, sniper_info
                 annotation_position="top right"
             )
 
-        # 策略狀態標籤
         fig.add_annotation(
             text=f"策略狀態：{status}",
             xref="paper", yref="paper",
@@ -1258,7 +1397,6 @@ def plot_diagnosis_chart(df, stock_input, analysis_date_str, params, sniper_info
             borderwidth=1
         )
 
-    # 成交量
     colors = ['red' if c >= o else 'green'
               for c, o in zip(plot_df['Close'], plot_df['Open'])]
     fig.add_trace(go.Bar(
@@ -1275,10 +1413,6 @@ def plot_diagnosis_chart(df, stock_input, analysis_date_str, params, sniper_info
     return fig
 
 def run_backtest_ui(df, stock_input, params):
-    """
-    修改項目 4：回測功能接入 UI
-    執行 SniperStrategy 回測並顯示績效報告
-    """
     try:
         bt_df = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy().dropna()
         bt_df.index = pd.to_datetime(bt_df.index)
@@ -1287,11 +1421,10 @@ def run_backtest_ui(df, stock_input, params):
             bt_df,
             SniperStrategy,
             cash=100000,
-            commission=0.001425 * 2,  # 台股手續費雙邊
+            commission=0.001425 * 2,
             trade_on_close=False
         )
 
-        # 套用側邊欄參數
         stats = bt.run(
             ma_trend_period=params['s_ma_trend'],
             big_candle_pct=params['s_big_candle'],
@@ -1299,7 +1432,6 @@ def run_backtest_ui(df, stock_input, params):
             use_year_line=params['s_use_year']
         )
 
-        # 顯示關鍵指標
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("總報酬率", f"{stats['Return [%]']:.1f}%")
         col2.metric("最大回撤", f"{stats['Max. Drawdown [%]']:.1f}%")
@@ -1312,7 +1444,6 @@ def run_backtest_ui(df, stock_input, params):
         col7.metric("買入持有報酬", f"{stats['Buy & Hold Return [%]']:.1f}%")
         col8.metric("Calmar 比率", f"{stats['Calmar Ratio']:.2f}" if 'Calmar Ratio' in stats else "N/A")
 
-        # 顯示交易明細
         trades = stats['_trades']
         if not trades.empty:
             st.markdown("#### 📋 交易明細")
@@ -1322,7 +1453,6 @@ def run_backtest_ui(df, stock_input, params):
             trades_display['損益'] = trades_display['損益'].round(2)
             st.dataframe(trades_display, hide_index=True, use_container_width=True)
 
-        # 權益曲線
         equity = stats['_equity_curve']['Equity']
         fig_eq = go.Figure()
         fig_eq.add_trace(go.Scatter(
@@ -1344,16 +1474,16 @@ def run_backtest_ui(df, stock_input, params):
 # ==========================================
 # 🖥️ 介面主程式
 # ==========================================
-st.sidebar.title("🔥 強勢股戰情室 V11")
+st.sidebar.title("🔥 強勢股戰情室 V12")
 st.sidebar.caption("波段與短線的極致整合")
 
-# 修改項目 2：顯示目前快取模式
 cache_mode = "🟢 盤中模式 (5分鐘快取)" if is_trading_hours() else "🔵 盤後模式 (1小時快取)"
 st.sidebar.caption(cache_mode)
 
 analysis_date_input = st.sidebar.date_input("分析基準日", datetime.date.today())
 analysis_date_str = analysis_date_input.strftime('%Y-%m-%d')
 
+# ================= V12 統一按鈕 =================
 start_scan = st.sidebar.button("🚀 開始全域掃描 (極速版)", type="primary")
 status_text = st.sidebar.empty()
 progress_bar = st.sidebar.empty()
@@ -1366,12 +1496,31 @@ with st.sidebar.expander("🟢 狙擊手策略參數 (波段)", expanded=True):
     s_big_candle = st.slider("長紅漲幅門檻 (%)", 2.0, 10.0, 5.0, 0.5) / 100
     s_min_vol = st.number_input("波段最小量 (張)", value=1000) * 1000
     s_setup_lookback = st.slider("長紅K回溯天數", 5, 30, 25, 5)
-    st.caption("預設25天，整理期較長的型態建議拉高")
     s_vol_ma_days = st.slider("長紅K量能基準 (MA天數)", 5, 20, 20, 5)
-    s_vol_ratio = st.slider("長紅K量能門檻 (倍)", 0.5, 1.5, 0.8, 0.1)
-    st.caption("量 > 基準均量 × 門檻倍數才算長紅K")
+    # V12修改：預設值改為 0.7
+    s_vol_ratio = st.slider("長紅K量能門檻 (倍)", 0.5, 1.5, 0.7, 0.1)
     s_pullback_max = st.slider("整理回測深度上限 (%)", 20, 70, 50, 5)
-    st.caption("整理期收盤最低點回測長紅K收盤超過此比例則過濾")
+
+with st.sidebar.expander("🎯 處置股策略參數", expanded=True):
+    d_show_all = st.checkbox("顯示全部（含無訊號）", value=False)
+    d_vol_filter = st.checkbox("啟用底量濾網", value=True)
+    d_min_vol_disp = st.number_input("底量門檻（張）", min_value=0, max_value=10000, value=1000, step=100, disabled=not d_vol_filter)
+
+with st.sidebar.expander("🐂 BULL_v7 布林滾雪球參數", expanded=False):
+    b_boll_period  = st.number_input("布林週期", value=15, min_value=5, max_value=60, key="b_bp")
+    b_boll_std     = st.number_input("布林標準差", value=2.1, min_value=1.0, max_value=3.0, step=0.1, key="b_bs")
+    b_squeeze_n    = st.number_input("壓縮天數", value=15, min_value=5, max_value=60, key="b_sn")
+    b_squeeze_lb   = st.number_input("壓縮回溯天數", value=5, min_value=1, max_value=15, key="b_sl")
+    b_vol_ratio    = st.number_input("爆量倍數", value=1.5, min_value=1.0, max_value=5.0, step=0.1, key="b_vr")
+    b_sma_days     = st.number_input("中軌趨勢天數", value=3, min_value=1, max_value=10, key="b_sd")
+    b_min_vol      = st.number_input("20日均量門檻(張)", value=1000, min_value=100, step=100, key="b_mv") * 1000
+    b_addon_b_pct  = st.number_input("加碼B門檻(%)", value=10, min_value=1, max_value=50, key="b_ab") / 100
+
+# BULL GSheet 狀態
+if bull_use_gsheet():
+    st.sidebar.success("🟢 BULL 持倉已連線 Google Sheets")
+elif GSPREAD_AVAILABLE:
+    st.sidebar.caption("⚠️ BULL：未設定 Sheets Secrets，使用暫存模式")
 
 with st.sidebar.expander("⚡ 隔日沖策略參數 (短線)", expanded=True):
     d_period = st.slider("追蹤波段天數 (N)", 10, 120, 60, 5)
@@ -1387,16 +1536,45 @@ params = {
     's_big_candle': s_big_candle, 's_min_vol': s_min_vol,
     's_setup_lookback': s_setup_lookback, 's_vol_ma_days': s_vol_ma_days, 's_vol_ratio': s_vol_ratio, 's_pullback_max': s_pullback_max,
     'd_period': d_period, 'd_threshold': d_threshold,
-    'd_min_pct': d_min_pct, 'd_min_vol': d_min_vol
+    'd_min_pct': d_min_pct, 'd_min_vol': d_min_vol,
+    'disp_show_all': d_show_all, 'disp_vol_filter': d_vol_filter, 'disp_min_vol': d_min_vol_disp
 }
 
-tab1, tab2, tab3, tab4 = st.tabs(["🟢 狙擊手波段", "🎯 處置股策略", "⚡ 隔日沖雷達", "📊 個股診斷"])
+bull_params = {
+    **BULL_PARAMS,
+    "boll_period"    : int(b_boll_period),
+    "boll_std"       : float(b_boll_std),
+    "squeeze_n"      : int(b_squeeze_n),
+    "squeeze_lookback": int(b_squeeze_lb),
+    "vol_ratio"      : float(b_vol_ratio),
+    "sma_trend_days" : int(b_sma_days),
+    "min_vol_shares" : int(b_min_vol),
+    "addon_b_profit" : float(b_addon_b_pct),
+}
+
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["🟢 狙擊手波段", "🎯 處置股策略", "🐂 BULL滾雪球", "⚡ 隔日沖雷達", "📊 個股診斷"])
 
 # ==========================================
-# 修改項目 7：Session State 管理 + 參數變更警告
+# Session State 管理
 # ==========================================
 if 'scan_results' not in st.session_state:
     st.session_state['scan_results'] = None
+if 'bull_results' not in st.session_state:
+    st.session_state['bull_results'] = None
+if 'bull_positions' not in st.session_state:
+    st.session_state['bull_positions'] = pd.DataFrame(columns=BULL_SHEET_COLS)
+if 'bull_gs_loaded' not in st.session_state:
+    st.session_state['bull_gs_loaded'] = False
+# 首次啟動從 Google Sheets 載入 BULL 持倉
+if not st.session_state['bull_gs_loaded'] and bull_use_gsheet():
+    df_gs = bull_gs_load()
+    if len(df_gs) > 0:
+        st.session_state['bull_positions'] = df_gs
+    st.session_state['bull_gs_loaded'] = True
+if 'disposal_results' not in st.session_state:
+    st.session_state['disposal_results'] = None
+if 'disposal_active' not in st.session_state:
+    st.session_state['disposal_active'] = None
 if 'scan_params' not in st.session_state:
     st.session_state['scan_params'] = None
 if 'scan_date' not in st.session_state:
@@ -1404,17 +1582,19 @@ if 'scan_date' not in st.session_state:
 if 'market_status' not in st.session_state:
     st.session_state['market_status'] = None
 
-# 檢查參數是否與上次掃描時不同
 def params_changed():
     if st.session_state['scan_params'] is None:
         return False
     return (st.session_state['scan_params'] != params or
             st.session_state['scan_date'] != analysis_date_str)
 
+# ==========================================
+# 執行整合掃描
+# ==========================================
 if start_scan:
+    # ---------------- 1. 狙擊手與隔日沖 ----------------
     stock_map = get_stock_info_map()
 
-    # 大盤狀態
     status_text.text("📈 正在判斷大盤狀態...")
     market_status = fetch_market_status(analysis_date_str)
     st.session_state['market_status'] = market_status
@@ -1427,6 +1607,9 @@ if start_scan:
 
     status_text.text("🔄 正在批量下載歷史資料 (yfinance)...")
     history_data_store = fetch_data_batch(stock_map)
+    # 存入 session_state 供 BULL_v7 掃描共用（不重複下載）
+    st.session_state['all_data_cache']   = history_data_store
+    st.session_state['stock_map_cache']  = stock_map
 
     today_str = datetime.datetime.now().strftime('%Y-%m-%d')
     realtime_map = {}
@@ -1434,7 +1617,7 @@ if start_scan:
         status_text.text("⚡ 正在批量更新即時盤 (twstock)...")
         realtime_map = fetch_realtime_batch(list(history_data_store.keys()))
 
-    status_text.text("🧠 正在進行策略運算...")
+    status_text.text("🧠 正在進行大盤與波段策略運算...")
     progress_bar.progress(0)
 
     tasks_data = {}
@@ -1452,7 +1635,7 @@ if start_scan:
                 else:
                     df = pd.concat([df, new_row.to_frame().T])
             except Exception as e:
-                logger.warning(f"即時資料合併錯誤 [{code}]: {e}")
+                pass
         tasks_data[code] = df
 
     total = len(tasks_data)
@@ -1466,8 +1649,8 @@ if start_scan:
         for future in concurrent.futures.as_completed(futures):
             done += 1
             if done % 50 == 0 or done == total:
-                progress_bar.progress(done / total)
-                status_text.text(f"策略運算中: {done}/{total}")
+                progress_bar.progress(done / max(total, 1))
+                status_text.text(f"波段策略運算中: {done}/{total}")
             res = future.result()
             if isinstance(res, dict):
                 if res['sniper']:
@@ -1482,10 +1665,6 @@ if start_scan:
                 stock_name = stock_map[current_code]['short_name']
                 failed_list.append(f"{current_code} {stock_name} : {res}")
 
-    progress_bar.progress(1.0)
-    status_text.success(f"掃描完成！ (成功: {len(tasks_data)} / 失敗: {len(failed_list)})")
-
-    # 修改項目 7：儲存掃描當下的參數與日期
     st.session_state['scan_results'] = {
         'sniper_triggered': sniper_triggered,
         'sniper_setup': sniper_setup,
@@ -1493,20 +1672,92 @@ if start_scan:
         'day_candidates': day_candidates,
         'failed_list': failed_list
     }
+
+    # ---------------- 2. 處置股策略 ----------------
+    status_text.text("📋 正在取得並分析處置股清單...")
+    progress_bar.progress(0)
+    
+    disposal_map = fetch_disposal_stocks()
+    if not disposal_map:
+        st.warning("⚠️ 無法自動取得處置股清單")
+        disposal_map = {}
+        
+    lookahead = analysis_date_input + datetime.timedelta(days=3)
+    d_active        = {k: v for k, v in disposal_map.items() if v['start'] <= lookahead and v['end'] >= analysis_date_input}
+    d_active_now    = {k: v for k, v in d_active.items() if v['start'] <= analysis_date_input}
+    d_active_coming = {k: v for k, v in d_active.items() if v['start'] > analysis_date_input}
+
+    d_results = []
+    total_d = len(d_active_now)
+    for i, (code, info) in enumerate(d_active_now.items()):
+        status_text.text(f"🔍 處置股分析中... {code} {info['name']} ({i+1}/{total_d})")
+        progress_bar.progress((i+1) / max(total_d, 1))
+        
+        result = analyze_disposal_stock(code, info, analysis_date_input, min_vol=d_min_vol_disp if d_vol_filter else 0)
+        
+        if result:
+            d_results.append(result)
+        elif d_show_all:
+            d_results.append({
+                'code': code, 'name': info['name'],
+                'market': '上市' if info['market'] == 'twse' else '上櫃',
+                'disposal_start': info['start'].strftime('%Y-%m-%d'),
+                'disposal_end':   info['end'].strftime('%Y-%m-%d'),
+                'days_left': max((info['end'] - analysis_date_input).days, 0),
+                'status': '⚪ 無訊號', 'is_new_today': False,
+                'entry_date': '-', 'entry_price': '-',
+                'exit_date': '-', 'exit_price': '-',
+                'profit_pct': '-', 'exit_reason': '-',
+                'signal_date': '-', 'signal_close': '-',
+                'signal_prev_high': '-', 'signal_pct': '-',
+                'total_trades': 0,
+            })
+        time.sleep(0.1)
+
+    st.session_state['disposal_results'] = d_results
+    st.session_state['disposal_active'] = {
+        'now': d_active_now,
+        'coming': d_active_coming
+    }
+
+    progress_bar.progress(1.0)
+    status_text.success("✅ 全域掃描（波段、隔日沖、處置股）已完成！")
+
     st.session_state['scan_params'] = params.copy()
     st.session_state['scan_date'] = analysis_date_str
 
+
 results = st.session_state['scan_results']
 
-# 修改項目 7：參數變更提醒
 if results is not None and params_changed():
     st.warning("⚠️ 您已修改策略參數或分析日期，目前顯示的結果為**上次掃描**的資料，請重新執行掃描以取得最新結果。")
 
+
+# ==========================================
+# 🐂 BULL_v7 掃描（共用 all_data，不重複下載）
+# ==========================================
+if start_scan and results and 'all_data_cache' in st.session_state:
+    status_text.text("🐂 BULL_v7 布林滾雪球掃描中...")
+    try:
+        bull_res = bull_run_scan(
+            stock_map         = st.session_state['stock_map_cache'],
+            all_data          = st.session_state['all_data_cache'],
+            scan_date_str     = analysis_date_str,
+            bull_positions    = st.session_state['bull_positions'],
+            bull_params       = bull_params,
+            max_workers       = max_workers_input,
+        )
+        st.session_state['bull_results'] = bull_res
+    except Exception as e:
+        logger.error(f"BULL 掃描錯誤: {e}")
+
+# ==========================================
+# 介面顯示：Tab 1 (狙擊手波段)
+# ==========================================
 with tab1:
     st.header("🟢 狙擊手波段策略")
     st.caption(f"基準日: {analysis_date_str} | 策略：趨勢 + 實體長紅 + 型態確認 (防守點含 1% 誤差)")
 
-    # --- 大盤狀態列 ---
     mkt = st.session_state.get('market_status')
     if mkt:
         mc1, mc2, mc3, mc4 = st.columns(4)
@@ -1531,7 +1782,6 @@ with tab1:
         watch_strong   = [x for x in s_watch if "強勢整理" in x['狀態']]
         watch_pullback = [x for x in s_watch if "回檔整理" in x['狀態']]
 
-        # --- 買點觸發 ---
         if trig_strong or trig_n:
             all_triggered = trig_strong + trig_n
             st.markdown("### 🎯 買點觸發訊號 (Actionable)")
@@ -1551,7 +1801,6 @@ with tab1:
                 drop_cols = [c for c in ['sort_pct', '_score', '_risk_pct'] if c in df_tn.columns]
                 display_full_table(df_tn.drop(columns=drop_cols))
 
-            # --- 產業強度泡泡圖 ---
             st.divider()
             st.markdown("### 🫧 產業強度分析")
             st.caption("右上角 = 廣度與強度兼具的強勢產業，泡泡大小代表訊號數")
@@ -1592,136 +1841,229 @@ with tab1:
                     margin=dict(l=20, r=20, t=20, b=20)
                 )
                 st.plotly_chart(fig_bubble, use_container_width=True)
-
-
     else:
         st.info("👈 請點擊左側「開始全域掃描」按鈕。")
 
+# ==========================================
+# 介面顯示：Tab 2 (處置股策略)
+# ==========================================
 with tab2:
     st.markdown("### 🎯 處置股策略")
     st.caption("僅限每5分鐘撮合處置股｜進場：收盤站上前日最高點｜出場：獲利<15%跌破10MA，獲利≥15%跌破5MA")
+    
+    if st.session_state['disposal_results'] is not None:
+        d_results = st.session_state['disposal_results']
+        d_active_now = st.session_state['disposal_active']['now']
+        d_active_coming = st.session_state['disposal_active']['coming']
 
-    col_d1, col_d2 = st.columns([2, 2])
-    with col_d1:
-        d_analysis_date = st.date_input("分析基準日", datetime.date.today(), key="disposal_date")
-    with col_d2:
-        d_show_all = st.checkbox("顯示全部（含無訊號）", value=False, key="disposal_show_all")
+        st.info(f"📋 處置中 **{len(d_active_now)}** 支｜即將開始（3天內）**{len(d_active_coming)}** 支")
 
-    col_d3, col_d4 = st.columns([1, 3])
-    with col_d3:
-        d_vol_filter = st.checkbox("啟用底量濾網", value=True, key="disposal_vol_filter")
-    with col_d4:
-        d_min_vol = st.number_input("底量門檻（張）", min_value=0, max_value=10000,
-                                     value=1000, step=100, key="disposal_min_vol",
-                                     disabled=not d_vol_filter)
+        d_new_today = [r for r in d_results if r.get('is_new_today')]
+        d_holding   = [r for r in d_results if r.get('status') == '🟢 持有中' and not r.get('is_new_today')]
+        d_exited    = [r for r in d_results if r.get('status') == '⚫ 已出場']
+        d_no_signal = [r for r in d_results if r.get('status') == '⚪ 無訊號']
 
-    d_scan_btn = st.button("🔍 開始掃描處置股", type="primary", key="disposal_scan")
-
-    if d_scan_btn:
-        with st.spinner("📋 正在取得處置股清單..."):
-            disposal_map = fetch_disposal_stocks()
-
-        if not disposal_map:
-            st.error("❌ 無法自動取得處置股清單")
-            manual_input = st.text_input("手動輸入代號（逗號分隔）", placeholder="3234,6271", key="disposal_manual")
-            if manual_input:
-                for _c in manual_input.replace('，', ',').split(','):
-                    _c = _c.strip()
-                    if len(_c) == 4 and _c.isdigit():
-                        disposal_map[_c] = {
-                            'name': _c, 'market': 'twse',
-                            'start': d_analysis_date - datetime.timedelta(days=30),
-                            'end':   d_analysis_date + datetime.timedelta(days=30),
-                            'symbol': f"{_c}.TW"
-                        }
+        st.markdown(f"#### 🔴 今日新訊號 ({len(d_new_today)} 支)")
+        if d_new_today:
+            show_disposal_table(d_new_today)
         else:
-            lookahead = d_analysis_date + datetime.timedelta(days=3)
-            d_active        = {k: v for k, v in disposal_map.items()
-                               if v['start'] <= lookahead and v['end'] >= d_analysis_date}
-            d_active_now    = {k: v for k, v in d_active.items() if v['start'] <= d_analysis_date}
-            d_active_coming = {k: v for k, v in d_active.items() if v['start'] > d_analysis_date}
-
-            st.info(f"📋 處置中 **{len(d_active_now)}** 支｜即將開始（3天內）**{len(d_active_coming)}** 支")
-
-            if not d_active:
-                st.warning("目前沒有符合條件的處置股")
+            if d_active_coming:
+                st.info(f"今日無訊號，以下 {len(d_active_coming)} 支即將進入處置期間：")
+                st.dataframe(pd.DataFrame([{
+                    '代號': k, '名稱': v['name'],
+                    '市場': '上市' if v['market'] == 'twse' else '上櫃',
+                    '處置開始': v['start'].strftime('%Y-%m-%d'),
+                    '處置結束': v['end'].strftime('%Y-%m-%d')
+                } for k, v in d_active_coming.items()]), use_container_width=True, hide_index=True)
             else:
-                d_results = []
-                d_progress = st.progress(0)
-                d_status = st.empty()
+                st.info(f"基準日 {analysis_date_str} 無今日訊號")
 
-                for i, (code, info) in enumerate(d_active_now.items()):
-                    d_status.text(f"🔍 分析中... {code} {info['name']} ({i+1}/{len(d_active_now)})")
-                    d_progress.progress((i+1) / max(len(d_active_now), 1))
-                    result = analyze_disposal_stock(code, info, d_analysis_date,
-                                                    min_vol=d_min_vol if d_vol_filter else 0)
-                    if result:
-                        d_results.append(result)
-                    elif d_show_all:
-                        d_results.append({
-                            'code': code, 'name': info['name'],
-                            'market': '上市' if info['market'] == 'twse' else '上櫃',
-                            'disposal_start': info['start'].strftime('%Y-%m-%d'),
-                            'disposal_end':   info['end'].strftime('%Y-%m-%d'),
-                            'days_left': max((info['end'] - d_analysis_date).days, 0),
-                            'status': '⚪ 無訊號', 'is_new_today': False,
-                            'entry_date': '-', 'entry_price': '-',
-                            'exit_date': '-', 'exit_price': '-',
-                            'profit_pct': '-', 'exit_reason': '-',
-                            'signal_date': '-', 'signal_close': '-',
-                            'signal_prev_high': '-', 'signal_pct': '-',
-                            'total_trades': 0,
-                        })
-                    time.sleep(0.3)
+        if d_holding:
+            st.divider()
+            st.markdown(f"#### 🟢 持有中 ({len(d_holding)} 支)")
+            show_disposal_table(d_holding)
 
-                d_progress.empty()
-                d_status.empty()
+        if d_exited:
+            st.divider()
+            st.markdown(f"#### ⚫ 已出場 ({len(d_exited)} 支)")
+            show_disposal_table(d_exited)
 
-                d_new_today = [r for r in d_results if r.get('is_new_today')]
-                d_holding   = [r for r in d_results if r.get('status') == '🟢 持有中' and not r.get('is_new_today')]
-                d_exited    = [r for r in d_results if r.get('status') == '⚫ 已出場']
-                d_no_signal = [r for r in d_results if r.get('status') == '⚪ 無訊號']
+        if d_show_all and d_no_signal:
+            st.divider()
+            st.markdown(f"#### ⚪ 無訊號 ({len(d_no_signal)} 支)")
+            show_disposal_table(d_no_signal)
 
-                st.markdown(f"#### 🔴 今日新訊號 ({len(d_new_today)} 支)")
-                if d_new_today:
-                    show_disposal_table(d_new_today)
-                else:
-                    if d_active_coming:
-                        st.info(f"今日無訊號，以下 {len(d_active_coming)} 支即將進入處置期間：")
-                        st.dataframe(pd.DataFrame([{
-                            '代號': k, '名稱': v['name'],
-                            '市場': '上市' if v['market'] == 'twse' else '上櫃',
-                            '處置開始': v['start'].strftime('%Y-%m-%d'),
-                            '處置結束': v['end'].strftime('%Y-%m-%d')
-                        } for k, v in d_active_coming.items()]), use_container_width=True, hide_index=True)
-                    else:
-                        st.info(f"基準日 {d_analysis_date} 無今日訊號")
-
-                if d_holding:
-                    st.divider()
-                    st.markdown(f"#### 🟢 持有中 ({len(d_holding)} 支)")
-                    show_disposal_table(d_holding)
-
-                if d_exited:
-                    st.divider()
-                    st.markdown(f"#### ⚫ 已出場 ({len(d_exited)} 支)")
-                    show_disposal_table(d_exited)
-
-                if d_show_all and d_no_signal:
-                    st.divider()
-                    st.markdown(f"#### ⚪ 無訊號 ({len(d_no_signal)} 支)")
-                    show_disposal_table(d_no_signal)
-
-                st.divider()
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("處置中", f"{len(d_active_now)} 支")
-                c2.metric("今日新訊號", f"{len(d_new_today)} 支")
-                c3.metric("持有中", f"{len(d_holding) + len(d_new_today)} 支")
-                c4.metric("已出場", f"{len(d_exited)} 支")
+        st.divider()
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("處置中", f"{len(d_active_now)} 支")
+        c2.metric("今日新訊號", f"{len(d_new_today)} 支")
+        c3.metric("持有中", f"{len(d_holding) + len(d_new_today)} 支")
+        c4.metric("已出場", f"{len(d_exited)} 支")
     else:
-        st.info("👈 點擊「開始掃描處置股」取得今日訊號")
+        st.info("👈 請點擊左側「開始全域掃描」按鈕。")
 
+# ==========================================
+# 介面顯示：Tab 3 (BULL_v7 布林滾雪球)
+# ==========================================
 with tab3:
+    st.header("🐂 BULL_v7 布林滾雪球掃描器")
+    bull_res = st.session_state.get('bull_results')
+    bull_pos = st.session_state['bull_positions']
+
+    # 持倉操作函數
+    def bull_add_pos(sym, name, price, date_str):
+        pos = st.session_state['bull_positions']
+        if sym in pos['symbol'].values:
+            return
+        new_row = pd.DataFrame([{
+            "symbol": sym, "name": name, "進場日期": date_str,
+            "進場價": round(price, 2), "上次加碼價": round(price, 2),
+            "持倉最高價": round(price, 2), "加碼次數": 0, "加碼紀錄": ""
+        }])
+        updated = pd.concat([pos, new_row], ignore_index=True)
+        st.session_state['bull_positions'] = updated
+        if bull_use_gsheet(): bull_gs_save(updated)
+
+    def bull_do_addon(sym, addon_type, price, date_str):
+        pos  = st.session_state['bull_positions']
+        mask = pos['symbol'] == sym
+        if not mask.any(): return
+        idx  = pos[mask].index[-1]
+        pos.loc[idx, '上次加碼價'] = round(price, 2)
+        pos.loc[idx, '加碼次數']   = int(pos.loc[idx, '加碼次數']) + 1
+        tag  = f"{date_str}({addon_type})"
+        prev = str(pos.loc[idx, '加碼紀錄'])
+        pos.loc[idx, '加碼紀錄']   = (prev + " → " + tag).strip(" → ") if prev else tag
+        st.session_state['bull_positions'] = pos
+        if bull_use_gsheet(): bull_gs_save(pos)
+
+    def bull_remove_pos(sym):
+        pos     = st.session_state['bull_positions']
+        updated = pos[pos['symbol'] != sym].reset_index(drop=True)
+        st.session_state['bull_positions'] = updated
+        if bull_use_gsheet(): bull_gs_save(updated)
+
+    # 更新持倉最高價
+    if bull_res:
+        pos = st.session_state['bull_positions']
+        for sym_, price_ in bull_res.get('high_updates', []):
+            mask = pos['symbol'] == sym_
+            if mask.any():
+                idx_ = pos[mask].index[-1]
+                if price_ > float(pos.loc[idx_, '持倉最高價']):
+                    pos.loc[idx_, '持倉最高價'] = price_
+        st.session_state['bull_positions'] = pos
+        bull_pos = pos
+
+    entry_n  = len(bull_res['entry'])   if bull_res else 0
+    addon_a_n= len(bull_res['addon_a']) if bull_res else 0
+    addon_b_n= len(bull_res['addon_b']) if bull_res else 0
+    exit_n   = len(bull_res['exit'])    if bull_res else 0
+    pos_n    = len(bull_pos)
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("📋 持倉", pos_n)
+    c2.metric("🟢 進場", entry_n)
+    c3.metric("🔵 加碼B", addon_b_n)
+    c4.metric("🟡 加碼A", addon_a_n)
+    c5.metric("🔴 出場", exit_n)
+
+    if not bull_res:
+        st.info("👈 點擊左側「開始全域掃描」後即可看到 BULL_v7 訊號。")
+    else:
+        bt1, bt2, bt3, bt4, bt5 = st.tabs([
+            f"🟢 進場({entry_n})", f"🔵 加碼B({addon_b_n})",
+            f"🟡 加碼A({addon_a_n})", f"🔴 出場({exit_n})", f"📋 持倉({pos_n})"
+        ])
+
+        with bt1:
+            if not bull_res['entry']:
+                st.info("今日無進場訊號")
+            else:
+                df_e = pd.DataFrame(bull_res['entry'])
+                st.dataframe(df_e, use_container_width=True, hide_index=True)
+                cols = st.columns(min(len(bull_res['entry']), 6))
+                for i, r in enumerate(bull_res['entry']):
+                    with cols[i % 6]:
+                        if st.button(f"✅ 加入 {r['代號']}", key=f"bull_add_{r['symbol']}"):
+                            bull_add_pos(r['symbol'], r['名稱'], r['收盤價'], analysis_date_str)
+                            st.success(f"{r['代號']} 已加入持倉")
+                            st.rerun()
+
+        with bt2:
+            if not bull_res['addon_b']:
+                st.info("今日無加碼B訊號")
+            else:
+                df_b = pd.DataFrame(bull_res['addon_b'])
+                st.dataframe(df_b, use_container_width=True, hide_index=True)
+                cols = st.columns(min(len(bull_res['addon_b']), 6))
+                for i, r in enumerate(bull_res['addon_b']):
+                    with cols[i % 6]:
+                        if st.button(f"🔵 加碼B {r['代號']}", key=f"bull_addb_{r['symbol']}"):
+                            bull_do_addon(r['symbol'], "突破新高", r['收盤價'], analysis_date_str)
+                            st.success(f"{r['代號']} 加碼B完成")
+                            st.rerun()
+
+        with bt3:
+            if not bull_res['addon_a']:
+                st.info("今日無加碼A訊號")
+            else:
+                df_a = pd.DataFrame(bull_res['addon_a'])
+                st.dataframe(df_a, use_container_width=True, hide_index=True)
+                cols = st.columns(min(len(bull_res['addon_a']), 6))
+                for i, r in enumerate(bull_res['addon_a']):
+                    with cols[i % 6]:
+                        if st.button(f"🟡 加碼A {r['代號']}", key=f"bull_adda_{r['symbol']}"):
+                            bull_do_addon(r['symbol'], "回測站回", r['收盤價'], analysis_date_str)
+                            st.success(f"{r['代號']} 加碼A完成")
+                            st.rerun()
+
+        with bt4:
+            if not bull_res['exit']:
+                st.info("今日無出場訊號")
+            else:
+                df_x = pd.DataFrame(bull_res['exit'])
+                st.dataframe(df_x, use_container_width=True, hide_index=True)
+                cols = st.columns(min(len(bull_res['exit']), 6))
+                for i, r in enumerate(bull_res['exit']):
+                    with cols[i % 6]:
+                        if st.button(f"🚪 出場 {r['代號']}", key=f"bull_exit_{r['symbol']}"):
+                            bull_remove_pos(r['symbol'])
+                            st.success(f"{r['代號']} 已出場")
+                            st.rerun()
+
+        with bt5:
+            if len(bull_pos) == 0:
+                st.info("目前無持倉")
+            else:
+                st.dataframe(bull_pos, use_container_width=True, hide_index=True)
+                st.markdown("**手動出場：**")
+                bcols = st.columns(min(len(bull_pos), 8))
+                for i, (_, row) in enumerate(bull_pos.iterrows()):
+                    label = str(row['symbol']).replace('.TW','').replace('.TWO','')
+                    with bcols[i % 8]:
+                        if st.button(f"🚪 {label}", key=f"bull_m_exit_{row['symbol']}"):
+                            bull_remove_pos(row['symbol'])
+                            st.rerun()
+                st.markdown("---")
+                csv = bull_pos.to_csv(index=False, encoding='utf-8-sig')
+                st.download_button("⬇️ 匯出持倉 CSV", data=csv,
+                                   file_name=f"BULL_positions_{analysis_date_str}.csv",
+                                   mime="text/csv")
+                uploaded = st.file_uploader("📂 匯入持倉 CSV", type="csv", key="bull_upload")
+                if uploaded:
+                    try:
+                        df_imp = pd.read_csv(uploaded, encoding='utf-8-sig')
+                        st.session_state['bull_positions'] = df_imp
+                        st.success(f"✅ 已匯入 {len(df_imp)} 筆持倉")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"匯入失敗：{e}")
+
+# ==========================================
+# 介面顯示：Tab 4 (隔日沖雷達)
+# ==========================================
+with tab4:
     st.header("⚡ 隔日沖雷達")
     if results:
         day_list = results['day_candidates']
@@ -1735,7 +2077,10 @@ with tab3:
     else:
         st.info("👈 請點擊左側「開始全域掃描」按鈕。")
 
-with tab4:
+# ==========================================
+# 介面顯示：Tab 5 (個股 K 線診斷)
+# ==========================================
+with tab5:
     st.header("📊 個股 K 線診斷")
 
     col_in, col_btn = st.columns([3, 1])
@@ -1744,7 +2089,6 @@ with tab4:
     with col_btn:
         diag_btn = st.button("診斷")
 
-    # 修改項目 4：回測按鈕
     run_bt = st.checkbox("同時執行回測", value=False, help="勾選後診斷時會一併執行 SniperStrategy 回測，需要較長時間")
 
     if diag_btn:
@@ -1752,7 +2096,6 @@ with tab4:
             df, symbol = run_diagnosis(stock_input, analysis_date_str, params)
 
         if df is not None:
-            # 修改項目 3：嘗試從掃描結果中找出訊號資訊
             sniper_info = None
             if results:
                 all_sniper = (
@@ -1765,17 +2108,14 @@ with tab4:
                         sniper_info = item
                         break
 
-            # 顯示策略命中狀態
             if sniper_info:
                 st.success(f"✅ 此股命中策略：{sniper_info.get('狀態', '')}　|　訊號日：{sniper_info.get('訊號日', sniper_info.get('_setup_date', 'N/A'))}")
             else:
                 st.info("ℹ️ 此股在最近一次掃描中未命中任何策略訊號（或尚未執行掃描）")
 
-            # 繪製圖表
             fig = plot_diagnosis_chart(df, stock_input, analysis_date_str, params, sniper_info)
             st.plotly_chart(fig, use_container_width=True)
 
-            # 修改項目 4：執行回測
             if run_bt:
                 st.markdown("---")
                 st.markdown("### 📈 SniperStrategy 回測結果")
