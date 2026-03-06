@@ -5,3 +5,5 @@ backtesting
 plotly
 twstock
 lxml
+gspread
+google-auth
