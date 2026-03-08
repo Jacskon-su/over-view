@@ -29,7 +29,10 @@ jobs:
       # 3. 安裝套件
       - name: 📦 Install dependencies
         run: |
-          pip install yfinance pandas pyarrow twstock
+          pip install --upgrade pip
+          pip install requests lxml beautifulsoup4
+          pip install twstock
+          pip install yfinance pandas pyarrow
 
       # 4. 執行更新腳本
       - name: 🔄 Run update_data.py
