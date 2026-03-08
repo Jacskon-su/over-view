@@ -1,17 +1,23 @@
 # ==========================================
-# 強勢股戰情室 V12
-# V2: Bug修復 + 評分系統 + 大盤狀態 + 產業泡泡圖
-# V3: 長紅K回溯天數、均量基準、量能門檻可調
-# V4: 回測深度過濾
-# V5: 表格移除整理振幅、量能倍數、評分欄位
-# V6: 下載加速（period縮短至300d + chunk_size擴大至150）
-# V7: 加入 10MA > 20MA > 60MA 多頭排列濾網
-# V8: 移除市場潛力名單
+# 強勢股戰情室 V16
+# V2:  Bug修復 + 評分系統 + 大盤狀態 + 產業泡泡圖
+# V3:  長紅K回溯天數、均量基準、量能門檻可調
+# V4:  回測深度過濾
+# V5:  表格移除整理振幅、量能倍數、評分欄位
+# V6:  下載加速（period縮短至300d + chunk_size擴大至150）
+# V7:  加入 10MA > 20MA > 60MA 多頭排列濾網
+# V8:  移除市場潛力名單
 # V10: 整合處置股策略（第二分頁）+ 底量濾網
 # V11: 修正處置股爬蟲 SSL 憑證驗證問題 (加上 verify=False 與關閉警告)
 # V12: 整合處置股掃描按鈕至左側欄，與主策略一鍵執行；修改狙擊手量能預設值為0.7倍
+# V13: 整合 BULL_v7 布林滾雪球策略（第三分頁）；Google Sheets 持倉同步
+# V14: 修正 BULL 掃描進度條顯示；掃描完成後正確更新狀態文字
+# V15: 處置股底量濾網預設改為不勾選；左側欄全部預設摺疊；版本號更新
+# V16: 歷史資料改從 GitHub data/history.parquet 讀取（取代 yfinance 批量下載）
+#      啟動速度大幅提升；資料由 GitHub Actions 每日 14:30 自動更新
 # ==========================================
 import streamlit as st
+import os
 import yfinance as yf
 import pandas as pd
 import concurrent.futures
@@ -64,7 +70,7 @@ warnings.filterwarnings("ignore")
 # ⚙️ 頁面設定
 # ==========================================
 st.set_page_config(
-    page_title="強勢股戰情室 V12",
+    page_title="強勢股戰情室 V16",
     page_icon="🔥",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -492,34 +498,54 @@ def bull_scan_one(code, info, df_raw, params, pos_map, scan_date_ts):
     return result
 
 
-def bull_run_scan(stock_map, all_data, scan_date_str, bull_positions, bull_params, max_workers=16):
-    """執行 BULL_v7 全市場掃描"""
+def bull_run_scan(stock_map, all_data, scan_date_str, bull_positions, bull_params,
+                  max_workers=16, status_text=None, progress_bar=None):
+    """執行 BULL_v7 全市場掃描（含進度條）"""
     scan_date_ts = pd.Timestamp(scan_date_str)
     pos_map = {row["symbol"]: row for _, row in bull_positions.iterrows()} if len(bull_positions) > 0 else {}
 
-    entry_list  = []
+    entry_list   = []
     addon_a_list = []
     addon_b_list = []
-    exit_list   = []
+    exit_list    = []
     high_updates = []
 
-    import concurrent.futures
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {}
-        for code, df_raw in all_data.items():
-            if code not in stock_map:
-                continue
-            info = stock_map[code]
-            sym  = info["symbol"]
-            futures[executor.submit(bull_scan_one, code, info, df_raw, bull_params, pos_map, scan_date_ts)] = code
+    valid_codes = {c: df for c, df in all_data.items() if c in stock_map}
+    total = len(valid_codes)
+    done  = 0
 
+    if status_text:
+        status_text.text(f"🐂 BULL_v7 策略運算中... (共 {total} 支)")
+    if progress_bar:
+        progress_bar.progress(0)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(bull_scan_one, code, stock_map[code], df_raw,
+                            bull_params, pos_map, scan_date_ts): code
+            for code, df_raw in valid_codes.items()
+        }
         for future in concurrent.futures.as_completed(futures):
+            done += 1
+            if done % 100 == 0 or done == total:
+                if progress_bar:
+                    progress_bar.progress(done / max(total, 1),
+                        text=f"🐂 BULL_v7 策略運算 {done}/{total}...")
             res = future.result()
-            if res["entry"]     : entry_list.append(res["entry"])
-            if res["addon_a"]   : addon_a_list.append(res["addon_a"])
-            if res["addon_b"]   : addon_b_list.append(res["addon_b"])
-            if res["exit"]      : exit_list.append(res["exit"])
+            if res["entry"]      : entry_list.append(res["entry"])
+            if res["addon_a"]    : addon_a_list.append(res["addon_a"])
+            if res["addon_b"]    : addon_b_list.append(res["addon_b"])
+            if res["exit"]       : exit_list.append(res["exit"])
             if res["high_update"]: high_updates.append(res["high_update"])
+
+    if status_text:
+        status_text.success(
+            f"✅ 全部掃描完成｜"
+            f"進場 {len(entry_list)} | 加碼A {len(addon_a_list)} | "
+            f"加碼B {len(addon_b_list)} | 出場 {len(exit_list)}"
+        )
+    if progress_bar:
+        progress_bar.empty()
 
     return {
         "entry": entry_list, "addon_a": addon_a_list,
@@ -531,6 +557,40 @@ def bull_run_scan(stock_map, all_data, scan_date_str, bull_positions, bull_param
 # ==========================================
 # 🚀 批量下載加速模組
 # ==========================================
+# ==========================================
+# 📂 從 GitHub data/history.parquet 讀取歷史資料（V16新增）
+# ==========================================
+PARQUET_PATH = "data/history.parquet"
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_history_parquet():
+    """
+    讀取 GitHub Actions 每日自動更新的歷史資料。
+    回傳格式與 fetch_data_batch 相同：{code: df}
+    ttl=1800 表示每 30 分鐘自動重新讀取一次。
+    """
+    if not os.path.exists(PARQUET_PATH):
+        return None, f"找不到 {PARQUET_PATH}，請確認 data/ 資料夾已上傳至 GitHub"
+
+    try:
+        df_all = pd.read_parquet(PARQUET_PATH)
+        df_all["date"] = pd.to_datetime(df_all["date"])
+
+        data_store = {}
+        for code, grp in df_all.groupby("code"):
+            grp = grp.sort_values("date").set_index("date")
+            grp = grp[["Open","High","Low","Close","Volume"]].copy()
+            grp.index.name = None
+            data_store[code] = grp
+
+        last_date = df_all["date"].max().strftime("%Y-%m-%d")
+        total     = len(data_store)
+        return data_store, f"✅ 歷史資料載入完成：{total} 支股票，最新日期 {last_date}"
+
+    except Exception as e:
+        return None, f"❌ 讀取 {PARQUET_PATH} 失敗：{e}"
+
+
 def fetch_data_batch(stock_map, period="300d", chunk_size=150):
     all_symbols = [info['symbol'] for info in stock_map.values()]
     data_store = {}
@@ -1540,8 +1600,20 @@ def run_backtest_ui(df, stock_input, params):
 # ==========================================
 # 🖥️ 介面主程式
 # ==========================================
-st.sidebar.title("🔥 強勢股戰情室 V12")
+st.sidebar.title("🔥 強勢股戰情室 V16")
 st.sidebar.caption("波段與短線的極致整合")
+
+# V16：顯示資料來源狀態
+if os.path.exists(PARQUET_PATH):
+    try:
+        import pyarrow.parquet as pq
+        meta   = pq.read_metadata(PARQUET_PATH)
+        size_mb = os.path.getsize(PARQUET_PATH) / 1024 / 1024
+        st.sidebar.success(f"📂 歷史資料：Parquet ({size_mb:.1f} MB)")
+    except Exception:
+        st.sidebar.success("📂 歷史資料：Parquet ✅")
+else:
+    st.sidebar.warning("⚠️ 未找到 data/history.parquet，將使用 yfinance 下載")
 
 cache_mode = "🟢 盤中模式 (5分鐘快取)" if is_trading_hours() else "🔵 盤後模式 (1小時快取)"
 st.sidebar.caption(cache_mode)
@@ -1549,14 +1621,14 @@ st.sidebar.caption(cache_mode)
 analysis_date_input = st.sidebar.date_input("分析基準日", datetime.date.today())
 analysis_date_str = analysis_date_input.strftime('%Y-%m-%d')
 
-# ================= V12 統一按鈕 =================
+# ================= V16 統一按鈕 =================
 start_scan = st.sidebar.button("🚀 開始全域掃描 (極速版)", type="primary")
 status_text = st.sidebar.empty()
 progress_bar = st.sidebar.empty()
 
 st.sidebar.divider()
 
-with st.sidebar.expander("🟢 狙擊手策略參數 (波段)", expanded=True):
+with st.sidebar.expander("🟢 狙擊手策略參數 (波段)", expanded=False):
     s_ma_trend = st.number_input("趨勢線 (MA)", value=60)
     s_use_year = st.checkbox("啟用年線 (240MA) 濾網", value=True)
     s_big_candle = st.slider("長紅漲幅門檻 (%)", 2.0, 10.0, 5.0, 0.5) / 100
@@ -1567,9 +1639,9 @@ with st.sidebar.expander("🟢 狙擊手策略參數 (波段)", expanded=True):
     s_vol_ratio = st.slider("長紅K量能門檻 (倍)", 0.5, 1.5, 0.7, 0.1)
     s_pullback_max = st.slider("整理回測深度上限 (%)", 20, 70, 50, 5)
 
-with st.sidebar.expander("🎯 處置股策略參數", expanded=True):
+with st.sidebar.expander("🎯 處置股策略參數", expanded=False):
     d_show_all = st.checkbox("顯示全部（含無訊號）", value=False)
-    d_vol_filter = st.checkbox("啟用底量濾網", value=True)
+    d_vol_filter = st.checkbox("啟用底量濾網", value=False)
     d_min_vol_disp = st.number_input("底量門檻（張）", min_value=0, max_value=10000, value=1000, step=100, disabled=not d_vol_filter)
 
 # BULL GSheet 狀態（expander 外，永遠可見）
@@ -1597,7 +1669,7 @@ with st.sidebar.expander("🐂 BULL_v7 布林滾雪球參數", expanded=False):
     else:
         st.info("ℹ️ 未安裝 gspread，使用暫存模式")
 
-with st.sidebar.expander("⚡ 隔日沖策略參數 (短線)", expanded=True):
+with st.sidebar.expander("⚡ 隔日沖策略參數 (短線)", expanded=False):
     d_period = st.slider("追蹤波段天數 (N)", 10, 120, 60, 5)
     d_threshold = st.slider("高點容許誤差 (%)", 0.0, 5.0, 1.0, 0.1)
     d_min_pct = st.slider("當日最低漲幅 (%)", 3.0, 9.0, 5.0, 0.1)
@@ -1680,8 +1752,22 @@ if start_scan:
     day_candidates = []
     failed_list = []
 
-    status_text.text("🔄 正在批量下載歷史資料 (yfinance)...")
-    history_data_store = fetch_data_batch(stock_map)
+    # ── V16：優先從 data/history.parquet 讀取（GitHub Actions 每日自動更新）──
+    # ── 若 parquet 不存在或讀取失敗，fallback 到 yfinance 批量下載 ──
+    status_text.text("📂 正在讀取歷史資料 (data/history.parquet)...")
+    history_data_store, load_msg = load_history_parquet()
+
+    if history_data_store is None:
+        # Parquet 不存在，fallback 到 yfinance
+        status_text.text("⚠️ Parquet 不存在，改用 yfinance 下載...")
+        logger.warning(f"load_history_parquet 失敗：{load_msg}，fallback 到 yfinance")
+        history_data_store = fetch_data_batch(stock_map)
+    else:
+        logger.info(load_msg)
+        status_text.text(load_msg)
+        # 只保留在 stock_map 內的 code
+        history_data_store = {k: v for k, v in history_data_store.items() if k in stock_map}
+
     # 存入 session_state 供 BULL_v7 掃描共用（不重複下載）
     st.session_state['all_data_cache']   = history_data_store
     st.session_state['stock_map_cache']  = stock_map
@@ -1709,7 +1795,7 @@ if start_scan:
                     df.iloc[-1] = new_row
                 else:
                     df = pd.concat([df, new_row.to_frame().T])
-            except Exception as e:
+            except Exception:
                 pass
         tasks_data[code] = df
 
@@ -1812,19 +1898,21 @@ if results is not None and params_changed():
 # 🐂 BULL_v7 掃描（共用 all_data，不重複下載）
 # ==========================================
 if start_scan and results and 'all_data_cache' in st.session_state:
-    status_text.text("🐂 BULL_v7 布林滾雪球掃描中...")
     try:
         bull_res = bull_run_scan(
-            stock_map         = st.session_state['stock_map_cache'],
-            all_data          = st.session_state['all_data_cache'],
-            scan_date_str     = analysis_date_str,
-            bull_positions    = st.session_state['bull_positions'],
-            bull_params       = bull_params,
-            max_workers       = max_workers_input,
+            stock_map      = st.session_state['stock_map_cache'],
+            all_data       = st.session_state['all_data_cache'],
+            scan_date_str  = analysis_date_str,
+            bull_positions = st.session_state['bull_positions'],
+            bull_params    = bull_params,
+            max_workers    = max_workers_input,
+            status_text    = status_text,
+            progress_bar   = progress_bar,
         )
         st.session_state['bull_results'] = bull_res
     except Exception as e:
         logger.error(f"BULL 掃描錯誤: {e}")
+        status_text.text("⚠️ BULL 掃描發生錯誤，請查看 log")
 
 # ==========================================
 # 介面顯示：Tab 1 (狙擊手波段)
