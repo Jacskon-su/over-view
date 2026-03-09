@@ -79,15 +79,22 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# Streamlit Cloud SSL patch：跳過台灣證交所憑證驗證（需在 import twstock 之前執行）
+import ssl as _ssl_patch
+_ssl_patch._create_default_https_context = _ssl_patch._create_unverified_context
+
+import pytz as _pytz_main
+_TW_TZ = _pytz_main.timezone("Asia/Taipei")
+def _now_tw():
+    """取得台灣當前時間（Streamlit Cloud 伺服器在美國，需轉換時區）"""
+    import datetime as _dtt, pytz as _ptz
+    return _dtt.datetime.now(_ptz.timezone("Asia/Taipei"))
+
 try:
     import twstock
 except ImportError:
     st.error("❌ 缺少 `twstock` 套件，請輸入 `pip install twstock` 安裝")
     st.stop()
-
-# Streamlit Cloud SSL patch：跳過台灣證交所憑證驗證
-import ssl as _ssl_patch
-_ssl_patch._create_default_https_context = _ssl_patch._create_unverified_context
 
 # Google Sheets（可選）
 try:
@@ -109,7 +116,7 @@ st.markdown("""
 # ==========================================
 def is_trading_hours():
     """判斷目前是否在台股交易時段 (09:00~13:30)"""
-    now = datetime.datetime.now()
+    now = _now_tw()
     if now.weekday() >= 5:  # 週六日
         return False
     market_open = now.replace(hour=9, minute=0, second=0, microsecond=0)
@@ -269,7 +276,7 @@ def get_stock_data_with_realtime(code, symbol, analysis_date_str):
         return None
 
     last_dt = df.index[-1].strftime('%Y-%m-%d')
-    today_str = datetime.datetime.now().strftime('%Y-%m-%d')
+    today_str = tw_now().strftime('%Y-%m-%d')
 
     if analysis_date_str == today_str and last_dt != today_str:
         try:
@@ -661,6 +668,8 @@ def fetch_realtime_batch(codes_list, chunk_size=50, status_text=None):
     """
     import urllib.request, json as _json
     import datetime as _dt
+    import pytz as _pytz
+    _TW = _pytz.timezone("Asia/Taipei")
     import ssl as _ssl
     _ctx = _ssl.create_default_context()
     _ctx.check_hostname = False
@@ -670,7 +679,7 @@ def fetch_realtime_batch(codes_list, chunk_size=50, status_text=None):
     _txt = status_text if status_text else st.sidebar.empty()
 
     # ── 判斷是否盤中（09:00～13:35）──
-    now         = _dt.datetime.now()
+    now         = _dt.datetime.now(_TW)
     is_intraday = _dt.time(9, 0) <= now.time() <= _dt.time(13, 35)
 
     logger.info(f"fetch_realtime_batch: is_intraday={is_intraday}, now={now.strftime('%H:%M:%S')}, codes={len(codes_list)}")
@@ -1823,7 +1832,7 @@ if start_scan:
     st.session_state['all_data_cache']   = history_data_store
     st.session_state['stock_map_cache']  = stock_map
 
-    today_str = datetime.datetime.now().strftime('%Y-%m-%d')
+    today_str = _now_tw().strftime('%Y-%m-%d')
     realtime_map = {}
     if analysis_date_str == today_str:
         status_text.text("⚡ 正在批量更新即時盤 (twstock)...")
@@ -2447,7 +2456,7 @@ with tab6:
                     st.success("證交所 API 正常 | 回傳 " + str(len(rows)) + " 筆")
                     st.caption("第一筆: " + str(rows[0]))
                 else:
-                    now_t = _dt.datetime.now().time()
+                    now_t = _now_tw().time()
                     if _dt.time(9, 0) <= now_t <= _dt.time(13, 35):
                         st.warning("盤中時間，此 API 尚無資料（正常，盤後才有）stat=" + str(stat))
                     else:
@@ -2482,7 +2491,7 @@ with tab6:
                 size_mb = os.path.getsize(PARQUET_PATH) / 1024 / 1024
                 last_dt = df_check["date"].max().strftime("%Y-%m-%d")
                 n_stocks = df_check["code"].nunique()
-                today = _dt.datetime.now().strftime("%Y-%m-%d")
+                today = _now_tw().strftime("%Y-%m-%d")
                 st.success("Parquet 正常 | " + str(n_stocks) + " 支  最新: " + last_dt + "  大小: " + str(round(size_mb, 1)) + " MB")
                 if last_dt < today:
                     st.warning("資料最新日期 " + last_dt + " 不是今天 " + today + "，請確認 GitHub Actions 是否已執行")
@@ -2493,7 +2502,7 @@ with tab6:
 
         # 5. 時間與模式
         st.subheader("5. 目前時間與模式判斷")
-        now_t = _dt.datetime.now()
+        now_t = _now_tw()
         intraday = _dt.time(9, 0) <= now_t.time() <= _dt.time(13, 35)
         if intraday:
             st.info("目前時間: " + now_t.strftime("%Y-%m-%d %H:%M:%S") + "  |  盤中模式 → 使用 twstock 即時報價")
