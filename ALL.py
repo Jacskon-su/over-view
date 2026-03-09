@@ -1,5 +1,5 @@
 # ==========================================
-# 強勢股戰情室 V16
+# 強勢股戰情室 V17_beta
 # V2:  Bug修復 + 評分系統 + 大盤狀態 + 產業泡泡圖
 # V3:  長紅K回溯天數、均量基準、量能門檻可調
 # V4:  回測深度過濾
@@ -13,8 +13,11 @@
 # V13: 整合 BULL_v7 布林滾雪球策略（第三分頁）；Google Sheets 持倉同步
 # V14: 修正 BULL 掃描進度條顯示；掃描完成後正確更新狀態文字
 # V15: 處置股底量濾網預設改為不勾選；左側欄全部預設摺疊；版本號更新
-# V16: 歷史資料改從 GitHub data/history.parquet 讀取（取代 yfinance 批量下載）
-#      啟動速度大幅提升；資料由 GitHub Actions 每日 14:30 自動更新
+# V16:      歷史資料改從 GitHub data/history.parquet 讀取（取代 yfinance 批量下載）
+#           啟動速度大幅提升；資料由 GitHub Actions 每日 14:30 自動更新
+#           修正 fetch_realtime_batch：STOCK_DAY_ALL 為盤後 API，盤中改用 twstock
+#           新增盤中/盤後自動切換邏輯
+# V17_beta: 新增「🔧 系統診斷」分頁：即時確認 twstock/資料來源/GitHub Actions 狀態
 # ==========================================
 import streamlit as st
 import os
@@ -70,7 +73,7 @@ warnings.filterwarnings("ignore")
 # ⚙️ 頁面設定
 # ==========================================
 st.set_page_config(
-    page_title="強勢股戰情室 V16",
+    page_title="強勢股戰情室 V17_beta",
     page_icon="🔥",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -562,7 +565,6 @@ def bull_run_scan(stock_map, all_data, scan_date_str, bull_positions, bull_param
 # ==========================================
 PARQUET_PATH = "data/history.parquet"
 
-@st.cache_data(ttl=1800, show_spinner=False)
 def load_history_parquet():
     """
     讀取 GitHub Actions 每日自動更新的歷史資料。
@@ -642,97 +644,137 @@ def fetch_data_batch(stock_map, period="300d", chunk_size=150):
             st.toast(f"批次下載錯誤: {e}")
             continue
 
-    progress_text.empty()
+    # progress cleared by caller
     bar.empty()
     return data_store
 
-def fetch_realtime_batch(codes_list, chunk_size=50):
+def fetch_realtime_batch(codes_list, chunk_size=50, status_text=None):
     """
     即時報價批量取得。
-    優先用證交所/櫃買 STOCK_DAY_ALL API（一次回傳全部，極速）。
-    若 API 失敗才 fallback 到 twstock（逐批，較慢）。
+    盤中：twstock 逐批查詢（唯一可靠的盤中即時資料來源）
+    盤後：證交所/櫃買 STOCK_DAY_ALL API（一次回傳全部收盤價）
+    V16修正：STOCK_DAY_ALL 是盤後 API，盤中會回傳空；改為優先 twstock，盤後才用 STOCK_DAY_ALL
     """
-    realtime_data = {}
-    progress_text = st.empty()
+    import urllib.request, json as _json
+    import datetime as _dt
 
-    # ── 方案A：證交所 STOCK_DAY_ALL（上市，一次全拿）──
-    try:
-        progress_text.text("⚡ 取得即時報價（證交所）...")
-        import urllib.request, json as _json
-        twse_url = "https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL?response=json"
-        req = urllib.request.Request(twse_url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            d = _json.loads(r.read())
-        if d.get("stat") == "OK" and d.get("data"):
-            # fields: 證券代號,證券名稱,成交股數,成交金額,開盤價,最高價,最低價,收盤價,漲跌價差,成交筆數
-            fields = d["fields"]
-            fi = {f: i for i, f in enumerate(fields)}
-            for row in d["data"]:
+    realtime_data = {}
+    _txt = status_text if status_text else st.sidebar.empty()
+
+    # ── 判斷是否盤中（09:00～13:35）──
+    now         = _dt.datetime.now()
+    is_intraday = _dt.time(9, 0) <= now.time() <= _dt.time(13, 35)
+
+    logger.info(f"fetch_realtime_batch: is_intraday={is_intraday}, now={now.strftime('%H:%M:%S')}, codes={len(codes_list)}")
+
+    if is_intraday:
+        # ── 盤中：直接用 twstock 逐批（盤後 API 沒資料）──
+        logger.info("盤中模式：使用 twstock 即時報價")
+        total_codes = len(codes_list)
+        _txt.text(f"⚡ 盤中即時盤更新中...（共 {total_codes} 支）")
+        rt_bar = st.sidebar.progress(0)
+        batch_count = 0
+        for i in range(0, total_codes, chunk_size):
+            chunk = codes_list[i:i + chunk_size]
+            done  = min(i + chunk_size, total_codes)
+            pct   = int(done / total_codes * 100)
+            batch_count += 1
+            _txt.text(f"⚡ 盤中即時盤 {done}/{total_codes} 支（{pct}%）批次{batch_count}")
+            rt_bar.progress(pct)
+            try:
+                t0 = _dt.datetime.now()
+                stocks = twstock.realtime.get(chunk)
+                elapsed = (_dt.datetime.now() - t0).total_seconds()
+                got = 0
+                if stocks:
+                    # 批量回傳頂層有 success(bool)，用 isinstance 過濾
+                    for code, data in stocks.items():
+                        if isinstance(data, dict) and data.get('success'):
+                            realtime_data[code] = data['realtime']
+                            got += 1
+                logger.info(f"批次{batch_count} twstock: {got}/{len(chunk)} 支成功, 耗時 {elapsed:.2f}s")
+                time.sleep(0.3)
+            except Exception as e:
+                logger.warning(f"twstock 即時盤錯誤: {e}")
+        rt_bar.progress(100)
+        _txt.text(f"✅ 盤中即時盤完成｜共 {len(realtime_data)}/{total_codes} 支｜{batch_count} 批次")
+        logger.info(f"twstock 即時報價取得 {len(realtime_data)} 筆，共 {batch_count} 批次")
+
+    else:
+        # ── 盤後：證交所 STOCK_DAY_ALL（一次全拿，速度快）──
+        logger.info("盤後模式：使用證交所/櫃買收盤資料")
+
+        # 方案A：證交所上市
+        try:
+            _txt.text("⚡ 取得收盤報價（證交所）...")
+            twse_url = "https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL?response=json"
+            req = urllib.request.Request(twse_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                d = _json.loads(r.read())
+            if d.get("stat") == "OK" and d.get("data"):
+                fields = d["fields"]
+                fi = {f: idx for idx, f in enumerate(fields)}
+                def _n(s):
+                    return float(str(s).replace(",","").replace("+","").replace("--","0")) if str(s) not in ("--","") else 0.0
+                for row in d["data"]:
+                    try:
+                        c = row[fi["證券代號"]].strip()
+                        realtime_data[c] = {
+                            "latest_trade_price": str(_n(row[fi["收盤價"]])),
+                            "open":   str(_n(row[fi["開盤價"]])),
+                            "high":   str(_n(row[fi["最高價"]])),
+                            "low":    str(_n(row[fi["最低價"]])),
+                            "accumulate_trade_volume": str(int(_n(row[fi["成交股數"]]) / 1000)),
+                        }
+                    except Exception:
+                        continue
+            logger.info(f"證交所收盤報價取得 {len(realtime_data)} 筆")
+        except Exception as e:
+            logger.warning(f"證交所 STOCK_DAY_ALL 失敗: {e}")
+
+        # 方案B：櫃買上櫃
+        try:
+            _txt.text("⚡ 取得收盤報價（櫃買中心）...")
+            tpex_url = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes"
+            req = urllib.request.Request(tpex_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                rows = _json.loads(r.read())
+            def _n2(s):
+                return float(str(s).replace(",","")) if str(s) not in ("--","","N/A") else 0.0
+            for row in rows:
                 try:
-                    c = row[fi["證券代號"]].strip()
-                    def _n(s):
-                        return float(str(s).replace(",","").replace("+","").replace("--","0")) if str(s) not in ("--","") else 0.0
+                    c = str(row.get("SecuritiesCompanyCode","")).strip()
                     realtime_data[c] = {
-                        "latest_trade_price": str(_n(row[fi["收盤價"]])),
-                        "open":   str(_n(row[fi["開盤價"]])),
-                        "high":   str(_n(row[fi["最高價"]])),
-                        "low":    str(_n(row[fi["最低價"]])),
-                        "accumulate_trade_volume": str(int(_n(row[fi["成交股數"]]) / 1000)),
+                        "latest_trade_price": str(_n2(row.get("Close","0"))),
+                        "open":   str(_n2(row.get("Open","0"))),
+                        "high":   str(_n2(row.get("High","0"))),
+                        "low":    str(_n2(row.get("Low","0"))),
+                        "accumulate_trade_volume": str(int(_n2(row.get("TradeVolume","0")) / 1000)),
                     }
                 except Exception:
                     continue
-        logger.info(f"證交所即時報價取得 {len(realtime_data)} 筆")
-    except Exception as e:
-        logger.warning(f"證交所 STOCK_DAY_ALL 失敗: {e}，改用 twstock")
+            logger.info(f"櫃買收盤報價合計 {len(realtime_data)} 筆")
+        except Exception as e:
+            logger.warning(f"櫃買 tpex_mainboard_quotes 失敗: {e}")
 
-    # ── 方案B：櫃買中心（上櫃，一次全拿）──
-    try:
-        progress_text.text("⚡ 取得即時報價（櫃買中心）...")
-        import urllib.request, json as _json
-        tpex_url = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes"
-        req = urllib.request.Request(tpex_url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            rows = _json.loads(r.read())
-        for row in rows:
-            try:
-                c = str(row.get("SecuritiesCompanyCode","")).strip()
-                def _n2(s):
-                    return float(str(s).replace(",","")) if str(s) not in ("--","","N/A") else 0.0
-                realtime_data[c] = {
-                    "latest_trade_price": str(_n2(row.get("Close","0"))),
-                    "open":   str(_n2(row.get("Open","0"))),
-                    "high":   str(_n2(row.get("High","0"))),
-                    "low":    str(_n2(row.get("Low","0"))),
-                    "accumulate_trade_volume": str(int(_n2(row.get("TradeVolume","0")) / 1000)),
-                }
-            except Exception:
-                continue
-        logger.info(f"櫃買即時報價合計 {len(realtime_data)} 筆")
-    except Exception as e:
-        logger.warning(f"櫃買 tpex_mainboard_quotes 失敗: {e}")
-
-    # ── 方案C：若兩個 API 都失敗，才 fallback twstock（逐批）──
-    if not realtime_data:
-        logger.warning("即時 API 全部失敗，fallback 到 twstock（速度較慢）")
-        codes_needed = [c for c in codes_list if c not in realtime_data]
-        for i in range(0, len(codes_needed), chunk_size):
-            chunk = codes_needed[i:i + chunk_size]
-            progress_text.text(f"⚡ twstock fallback... ({i}/{len(codes_needed)})")
-            try:
-                stocks = twstock.realtime.get(chunk)
-                if stocks:
-                    if 'success' in stocks:
-                        if stocks['success']:
-                            realtime_data[stocks['info']['code']] = stocks['realtime']
-                    else:
+        # 方案C：盤後 API 也失敗，fallback twstock
+        if not realtime_data:
+            logger.warning("盤後 API 全部失敗，fallback 到 twstock")
+            for i in range(0, len(codes_list), chunk_size):
+                chunk = codes_list[i:i + chunk_size]
+                _txt.text(f"⚡ twstock fallback... ({i}/{len(codes_list)})")
+                try:
+                    stocks = twstock.realtime.get(chunk)
+                    if stocks:
+                        # 批量回傳頂層有 success(bool)，用 isinstance 過濾
                         for code, data in stocks.items():
                             if isinstance(data, dict) and data.get('success'):
                                 realtime_data[code] = data['realtime']
-                time.sleep(0.3)
-            except Exception as e:
-                logger.warning(f"twstock fallback 錯誤: {e}")
+                    time.sleep(0.3)
+                except Exception as e:
+                    logger.warning(f"twstock fallback 錯誤: {e}")
 
-    progress_text.empty()
+    # progress cleared by caller
     return realtime_data
 
 # ==========================================
@@ -1600,7 +1642,7 @@ def run_backtest_ui(df, stock_input, params):
 # ==========================================
 # 🖥️ 介面主程式
 # ==========================================
-st.sidebar.title("🔥 強勢股戰情室 V16")
+st.sidebar.title("🔥 強勢股戰情室 V17_beta")
 st.sidebar.caption("波段與短線的極致整合")
 
 # V16：顯示資料來源狀態
@@ -1621,10 +1663,10 @@ st.sidebar.caption(cache_mode)
 analysis_date_input = st.sidebar.date_input("分析基準日", datetime.date.today())
 analysis_date_str = analysis_date_input.strftime('%Y-%m-%d')
 
-# ================= V16 統一按鈕 =================
+# ================= V17_beta 統一按鈕 =================
 start_scan = st.sidebar.button("🚀 開始全域掃描 (極速版)", type="primary")
 status_text = st.sidebar.empty()
-progress_bar = st.sidebar.empty()
+progress_bar = st.sidebar.progress(0)
 
 st.sidebar.divider()
 
@@ -1699,7 +1741,7 @@ bull_params = {
     "addon_b_profit" : float(b_addon_b_pct),
 }
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["🟢 狙擊手波段", "🎯 處置股策略", "🐂 BULL滾雪球", "⚡ 隔日沖雷達", "📊 個股診斷"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["🟢 狙擊手波段", "🎯 處置股策略", "🐂 BULL滾雪球", "⚡ 隔日沖雷達", "📊 個股診斷", "🔧 系統診斷"])
 
 # ==========================================
 # Session State 管理
@@ -1769,6 +1811,7 @@ if start_scan:
         history_data_store = {k: v for k, v in history_data_store.items() if k in stock_map}
 
     # 存入 session_state 供 BULL_v7 掃描共用（不重複下載）
+    # 先存 history_data_store，待即時盤注入後再以 tasks_data 覆蓋
     st.session_state['all_data_cache']   = history_data_store
     st.session_state['stock_map_cache']  = stock_map
 
@@ -1776,7 +1819,7 @@ if start_scan:
     realtime_map = {}
     if analysis_date_str == today_str:
         status_text.text("⚡ 正在批量更新即時盤 (twstock)...")
-        realtime_map = fetch_realtime_batch(list(history_data_store.keys()))
+        realtime_map = fetch_realtime_batch(list(history_data_store.keys()), status_text=status_text)
 
     status_text.text("🧠 正在進行大盤與波段策略運算...")
     progress_bar.progress(0)
@@ -1798,6 +1841,9 @@ if start_scan:
             except Exception:
                 pass
         tasks_data[code] = df
+
+    # V17：tasks_data 是最終版本（含即時盤或純 parquet），BULL 一律用這個
+    st.session_state['all_data_cache'] = tasks_data
 
     total = len(tasks_data)
     done = 0
@@ -1897,7 +1943,7 @@ if results is not None and params_changed():
 # ==========================================
 # 🐂 BULL_v7 掃描（共用 all_data，不重複下載）
 # ==========================================
-if start_scan and results and 'all_data_cache' in st.session_state:
+if start_scan and 'all_data_cache' in st.session_state:
     try:
         bull_res = bull_run_scan(
             stock_map      = st.session_state['stock_map_cache'],
@@ -2287,3 +2333,159 @@ with tab5:
                     run_backtest_ui(df, stock_input, params)
         else:
             st.error("查無資料，請確認代號是否正確")
+# ==========================================
+# 介面顯示：Tab 6 (系統診斷) - V17_beta 新增
+# ==========================================
+with tab6:
+    st.header("🔧 系統診斷")
+    st.caption("確認各資料來源與套件運作狀態")
+
+    import datetime as _dt
+    import urllib.request as _ureq
+    import json as _json
+
+    if st.button("🔄 執行診斷", type="primary"):
+        st.session_state["diag_done"] = True
+
+    if not st.session_state.get("diag_done", False):
+        st.info("點擊「執行診斷」開始檢查")
+    else:
+        st.markdown("---")
+
+        # 1. twstock（強制執行，不管盤中盤後）
+        st.subheader("1. twstock 套件")
+
+        col_a, col_b = st.columns([3, 1])
+        with col_a:
+            st.caption("強制查詢 twstock，不受盤中/盤後時間限制")
+        with col_b:
+            force_twstock = st.button("🔁 強制查詢 twstock", key="force_tw")
+
+        with st.spinner("檢查 twstock..."):
+            try:
+                import twstock as _tw
+
+                # ── 單支查詢（台積電 2330）──
+                st.markdown("**單支查詢（2330 台積電）**")
+                r = _tw.realtime.get("2330")
+                if r and r.get("success"):
+                    rt = r["realtime"]
+                    price = rt.get("latest_trade_price", "-")
+                    vol   = rt.get("accumulate_trade_volume", "-")
+                    if price == "-" or price == "0" or price is None:
+                        st.warning("twstock 連線正常，但現價為空（盤後正常，盤中若出現此訊息代表資料異常）")
+                    else:
+                        st.success("twstock 正常 | 台積電現價: " + str(price) + "  成交量: " + str(vol) + " 張")
+                    st.json({
+                        "code":   "2330",
+                        "price":  price,
+                        "open":   rt.get("open"),
+                        "high":   rt.get("high"),
+                        "low":    rt.get("low"),
+                        "volume": vol,
+                        "說明":   "盤後時間 price/volume 可能為空或0，屬正常現象",
+                    })
+                elif r and not r.get("success"):
+                    st.warning("twstock 回傳 success=False（盤後/假日正常，若盤中出現請回報）")
+                    st.json(r)
+                else:
+                    st.error("twstock 回傳空資料，可能是套件或網路問題")
+                    st.json({"raw": str(r)})
+
+                # ── 批量查詢（5支）驗證 ──
+                st.markdown("**批量查詢驗證（5支）**")
+                test_codes = ["2330", "2317", "2454", "2882", "0050"]
+                results_batch = _tw.realtime.get(test_codes)
+                if results_batch:
+                    rows_diag = []
+                    for c in test_codes:
+                        item = results_batch.get(c, {})
+                        ok   = item.get("success", False)
+                        rt_b = item.get("realtime", {}) if ok else {}
+                        p    = rt_b.get("latest_trade_price", "-")
+                        rows_diag.append({
+                            "代號": c,
+                            "success": ok,
+                            "現價": p,
+                            "狀態": "✅ 正常" if (ok and p not in ("-","0","")) else ("⚠️ 盤後空值" if ok else "❌ 失敗"),
+                        })
+                    import pandas as _pd
+                    st.dataframe(_pd.DataFrame(rows_diag), use_container_width=True, hide_index=True)
+                    ok_cnt = sum(1 for x in rows_diag if x["success"])
+                    st.caption("批量查詢：" + str(ok_cnt) + "/" + str(len(test_codes)) + " 支 success=True（盤後 success 可能為 False，屬正常）")
+                else:
+                    st.error("批量查詢回傳空資料")
+
+            except ImportError:
+                st.error("twstock 未安裝，請執行: pip install twstock")
+            except Exception as e:
+                st.error("twstock 錯誤: " + str(e))
+
+        # 2. 證交所 API
+        st.subheader("2. 證交所盤後 API")
+        with st.spinner("檢查證交所 API..."):
+            try:
+                url = "https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL?response=json"
+                req = _ureq.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with _ureq.urlopen(req, timeout=10) as resp:
+                    d = _json.loads(resp.read())
+                stat = d.get("stat", "無")
+                rows = d.get("data", [])
+                if stat == "OK" and rows:
+                    st.success("證交所 API 正常 | 回傳 " + str(len(rows)) + " 筆")
+                    st.caption("第一筆: " + str(rows[0]))
+                else:
+                    now_t = _dt.datetime.now().time()
+                    if _dt.time(9, 0) <= now_t <= _dt.time(13, 35):
+                        st.warning("盤中時間，此 API 尚無資料（正常，盤後才有）stat=" + str(stat))
+                    else:
+                        st.warning("API 回傳無資料 stat=" + str(stat) + "，可能是假日或尚未更新")
+            except Exception as e:
+                st.error("證交所 API 錯誤: " + str(e))
+
+        # 3. 櫃買 API
+        st.subheader("3. 櫃買中心 API")
+        with st.spinner("檢查櫃買 API..."):
+            try:
+                url = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes"
+                req = _ureq.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with _ureq.urlopen(req, timeout=10) as resp:
+                    rows = _json.loads(resp.read())
+                if rows:
+                    st.success("櫃買 API 正常 | 回傳 " + str(len(rows)) + " 筆")
+                    st.caption("第一筆: " + str(rows[0]))
+                else:
+                    st.warning("櫃買 API 回傳空資料")
+            except Exception as e:
+                st.error("櫃買 API 錯誤: " + str(e))
+
+        # 4. Parquet
+        st.subheader("4. 歷史資料 data/history.parquet")
+        if os.path.exists(PARQUET_PATH):
+            try:
+                import pandas as _pd
+                df_check = _pd.read_parquet(PARQUET_PATH)
+                df_check["date"] = _pd.to_datetime(df_check["date"])
+                size_mb = os.path.getsize(PARQUET_PATH) / 1024 / 1024
+                last_dt = df_check["date"].max().strftime("%Y-%m-%d")
+                n_stocks = df_check["code"].nunique()
+                today = _dt.datetime.now().strftime("%Y-%m-%d")
+                st.success("Parquet 正常 | " + str(n_stocks) + " 支  最新: " + last_dt + "  大小: " + str(round(size_mb, 1)) + " MB")
+                if last_dt < today:
+                    st.warning("資料最新日期 " + last_dt + " 不是今天 " + today + "，請確認 GitHub Actions 是否已執行")
+            except Exception as e:
+                st.error("Parquet 讀取失敗: " + str(e))
+        else:
+            st.error("找不到 " + str(PARQUET_PATH) + "，請先執行 init_data.py 並推上 GitHub")
+
+        # 5. 時間與模式
+        st.subheader("5. 目前時間與模式判斷")
+        now_t = _dt.datetime.now()
+        intraday = _dt.time(9, 0) <= now_t.time() <= _dt.time(13, 35)
+        if intraday:
+            st.info("目前時間: " + now_t.strftime("%Y-%m-%d %H:%M:%S") + "  |  盤中模式 → 使用 twstock 即時報價")
+        else:
+            st.info("目前時間: " + now_t.strftime("%Y-%m-%d %H:%M:%S") + "  |  盤後模式 → 使用證交所/櫃買收盤資料")
+
+        st.markdown("---")
+        st.caption("V17_beta 系統診斷 | 如有異常請截圖回報")
