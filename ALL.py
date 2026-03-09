@@ -85,6 +85,10 @@ except ImportError:
     st.error("❌ 缺少 `twstock` 套件，請輸入 `pip install twstock` 安裝")
     st.stop()
 
+# Streamlit Cloud SSL patch：跳過台灣證交所憑證驗證
+import ssl as _ssl_patch
+_ssl_patch._create_default_https_context = _ssl_patch._create_unverified_context
+
 # Google Sheets（可選）
 try:
     import gspread
@@ -657,6 +661,10 @@ def fetch_realtime_batch(codes_list, chunk_size=50, status_text=None):
     """
     import urllib.request, json as _json
     import datetime as _dt
+    import ssl as _ssl
+    _ctx = _ssl.create_default_context()
+    _ctx.check_hostname = False
+    _ctx.verify_mode = _ssl.CERT_NONE
 
     realtime_data = {}
     _txt = status_text if status_text else st.sidebar.empty()
@@ -709,7 +717,7 @@ def fetch_realtime_batch(codes_list, chunk_size=50, status_text=None):
             _txt.text("⚡ 取得收盤報價（證交所）...")
             twse_url = "https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL?response=json"
             req = urllib.request.Request(twse_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=10) as r:
+            with urllib.request.urlopen(req, timeout=10, context=_ctx) as r:
                 d = _json.loads(r.read())
             if d.get("stat") == "OK" and d.get("data"):
                 fields = d["fields"]
@@ -737,7 +745,7 @@ def fetch_realtime_batch(codes_list, chunk_size=50, status_text=None):
             _txt.text("⚡ 取得收盤報價（櫃買中心）...")
             tpex_url = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes"
             req = urllib.request.Request(tpex_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=10) as r:
+            with urllib.request.urlopen(req, timeout=10, context=_ctx) as r:
                 rows = _json.loads(r.read())
             def _n2(s):
                 return float(str(s).replace(",","")) if str(s) not in ("--","","N/A") else 0.0
@@ -2427,7 +2435,11 @@ with tab6:
             try:
                 url = "https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL?response=json"
                 req = _ureq.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                with _ureq.urlopen(req, timeout=10) as resp:
+                import ssl as _dssl
+                _dctx = _dssl.create_default_context()
+                _dctx.check_hostname = False
+                _dctx.verify_mode = _dssl.CERT_NONE
+                with _ureq.urlopen(req, timeout=10, context=_dctx) as resp:
                     d = _json.loads(resp.read())
                 stat = d.get("stat", "無")
                 rows = d.get("data", [])
@@ -2449,7 +2461,8 @@ with tab6:
             try:
                 url = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes"
                 req = _ureq.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                with _ureq.urlopen(req, timeout=10) as resp:
+                import ssl as _ssl3; _ctx3 = _ssl3.create_default_context(); _ctx3.check_hostname = False; _ctx3.verify_mode = _ssl3.CERT_NONE
+                with _ureq.urlopen(req, timeout=10, context=_ctx3) as resp:
                     rows = _json.loads(resp.read())
                 if rows:
                     st.success("櫃買 API 正常 | 回傳 " + str(len(rows)) + " 筆")
