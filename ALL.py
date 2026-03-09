@@ -79,9 +79,18 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Streamlit Cloud SSL patch：跳過台灣證交所憑證驗證（需在 import twstock 之前執行）
+# Streamlit Cloud SSL patch：twstock 用 requests，需要 patch Session 層級
 import ssl as _ssl_patch
 _ssl_patch._create_default_https_context = _ssl_patch._create_unverified_context
+
+import requests as _requests
+import urllib3 as _urllib3
+_urllib3.disable_warnings(_urllib3.exceptions.InsecureRequestWarning)
+_orig_request = _requests.Session.request
+def _unverified_request(self, method, url, **kwargs):
+    kwargs.setdefault('verify', False)
+    return _orig_request(self, method, url, **kwargs)
+_requests.Session.request = _unverified_request
 
 import pytz as _pytz_main
 _TW_TZ = _pytz_main.timezone("Asia/Taipei")
