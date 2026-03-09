@@ -734,9 +734,9 @@ def fetch_realtime_batch(codes_list, chunk_size=50, status_text=None):
         try:
             _txt.text("⚡ 取得收盤報價（證交所）...")
             twse_url = "https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL?response=json"
-            req = urllib.request.Request(twse_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=10, context=_ctx) as r:
-                d = _json.loads(r.read())
+            import requests as _req_twse
+            resp_twse = _req_twse.get(twse_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10, verify=False, allow_redirects=True)
+            d = resp_twse.json()
             if d.get("stat") == "OK" and d.get("data"):
                 fields = d["fields"]
                 fi = {f: idx for idx, f in enumerate(fields)}
@@ -2452,13 +2452,9 @@ with tab6:
         with st.spinner("檢查證交所 API..."):
             try:
                 url = "https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL?response=json"
-                req = _ureq.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                import ssl as _dssl
-                _dctx = _dssl.create_default_context()
-                _dctx.check_hostname = False
-                _dctx.verify_mode = _dssl.CERT_NONE
-                with _ureq.urlopen(req, timeout=10, context=_dctx) as resp:
-                    d = _json.loads(resp.read())
+                import requests as _req_diag
+                _r = _req_diag.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10, verify=False, allow_redirects=True)
+                d = _r.json()
                 stat = d.get("stat", "無")
                 rows = d.get("data", [])
                 if stat == "OK" and rows:
