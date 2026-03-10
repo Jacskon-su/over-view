@@ -7,6 +7,8 @@
 #      - 全面導入 永豐金 Shioaji API 作為 24H 唯一報價引擎。
 #      - 解決盤後 API 報錯導致策略全部無資料跳過的問題。
 #      - 全面修正 UTC 時區問題，確保所有時間均為台灣時間 (Asia/Taipei)。
+#      - (修復) 修正大盤無資料時的字串格式化 ValueError。
+#      - (修復) 修正 Shioaji Contracts 遍歷方式，確保股票清單與掃描正常執行。
 # ==========================================
 import streamlit as st
 import os
@@ -212,12 +214,20 @@ def get_detailed_sector(code, standard_group=None, custom_db=None):
 def get_stock_info_map(_api_instance):
     stock_map = {}
     try:
-        for contract in _api_instance.Contracts.Stocks:
-            code = contract.code
-            if len(code) == 4 and code.isdigit():
-                suffix = ".TW" if contract.exchange == "TSE" else ".TWO"
-                stock_map[code] = {'name': f"{code} {contract.name}", 'symbol': f"{code}{suffix}", 'short_name': contract.name, 'group': contract.category}
-    except Exception as e: logger.error(f"Shioaji 取得股票清單失敗: {e}")
+        # 修正：分別遍歷 TSE(上市) 與 OTC(上櫃) 市場合約
+        for exchange in [_api_instance.Contracts.Stocks.TSE, _api_instance.Contracts.Stocks.OTC]:
+            for contract in exchange:
+                code = contract.code
+                if len(code) == 4 and code.isdigit():
+                    suffix = ".TW" if contract.exchange == "TSE" else ".TWO"
+                    stock_map[code] = {
+                        'name': f"{code} {contract.name}", 
+                        'symbol': f"{code}{suffix}", 
+                        'short_name': contract.name, 
+                        'group': getattr(contract, 'category', '其他')
+                    }
+    except Exception as e: 
+        logger.error(f"Shioaji 取得股票清單失敗: {e}")
     return stock_map
 
 def get_stock_data_with_realtime(code, symbol, analysis_date_str, _api_instance):
@@ -233,8 +243,8 @@ def get_stock_data_with_realtime(code, symbol, analysis_date_str, _api_instance)
 
     if analysis_date_str == today_str and last_dt != today_str:
         try:
-            contract = _api_instance.Contracts.Stocks.get(code)
-            if contract:
+            if code in _api_instance.Contracts.Stocks:
+                contract = _api_instance.Contracts.Stocks[code]
                 snapshots = _api_instance.snapshots([contract])
                 if snapshots:
                     snap = snapshots[0]
@@ -479,7 +489,6 @@ def fetch_data_batch(stock_map, period="300d", chunk_size=150):
 def fetch_realtime_batch(codes_list, _api_instance, status_text=None):
     """
     不分盤中或盤後，一律使用永豐金 Shioaji API 獲取極速快照
-    徹底拔除所有不穩定的證交所與櫃買盤後 API！
     """
     realtime_data = {}
     _txt = status_text if status_text else st.sidebar.empty()
@@ -488,14 +497,19 @@ def fetch_realtime_batch(codes_list, _api_instance, status_text=None):
     rt_bar = st.sidebar.progress(0)
     
     try:
-        # 準備合約列表
-        contracts = [_api_instance.Contracts.Stocks.get(c) for c in codes_list if _api_instance.Contracts.Stocks.get(c)]
+        # 修正：使用字典查詢方式避免 `.get()` 問題
+        contracts = []
+        for c in codes_list:
+            try:
+                if c in _api_instance.Contracts.Stocks:
+                    contracts.append(_api_instance.Contracts.Stocks[c])
+            except: pass
+            
         total_c = len(contracts)
         
         if total_c > 0:
             _txt.text(f"⚡ 永豐金快照擷取中 (共 {total_c} 支)...")
             
-            # 為了避免一次塞太多，稍微切成每批 300 檔送出快照請求
             chunk_size = 300
             for i in range(0, total_c, chunk_size):
                 chunk = contracts[i:i + chunk_size]
@@ -503,7 +517,6 @@ def fetch_realtime_batch(codes_list, _api_instance, status_text=None):
                 
                 for snap in snapshots:
                     c = snap.code
-                    # 防呆處理：開盤前可能為 0
                     c_price = snap.close if snap.close > 0 else snap.previous_close
                     
                     realtime_data[c] = {
@@ -1045,7 +1058,16 @@ with tab1:
     st.caption(f"基準日: {analysis_date_str} | 策略：趨勢 + 實體長紅 + 型態確認 (防守點含 1% 誤差)")
     if mkt := st.session_state.get('market_status'):
         mc1, mc2, mc3, mc4 = st.columns(4)
-        mc1.metric("大盤狀態", mkt['label']); mc2.metric("加權指數", f"{mkt.get('close', '-'):,.0f}"); mc3.metric("20MA", f"{mkt.get('ma20', '-'):,.0f}"); mc4.metric("60MA", f"{mkt.get('ma60', '-'):,.0f}")
+        mc1.metric("大盤狀態", mkt['label'])
+        
+        # 🔧 修正：防止大盤抓不到資料時 ValueError 崩潰
+        c_val = mkt.get('close', '-')
+        m20_val = mkt.get('ma20', '-')
+        m60_val = mkt.get('ma60', '-')
+        mc2.metric("加權指數", f"{c_val:,.0f}" if isinstance(c_val, (int, float)) else str(c_val))
+        mc3.metric("20MA", f"{m20_val:,.0f}" if isinstance(m20_val, (int, float)) else str(m20_val))
+        mc4.metric("60MA", f"{m60_val:,.0f}" if isinstance(m60_val, (int, float)) else str(m60_val))
+        
         if not mkt['strong']: st.warning("⚠️ 大盤目前偏弱，建議降低持倉比例，訊號可信度下降。")
         st.divider()
 
