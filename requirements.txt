@@ -3,7 +3,10 @@ yfinance
 pandas
 backtesting
 plotly
-twstock
 lxml
 gspread
 google-auth
+shioaji
+beautifulsoup4
+pyarrow
+pytz
