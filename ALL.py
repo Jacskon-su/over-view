@@ -1,11 +1,11 @@
 # ==========================================
-# 強勢股戰情室 V18
+# 強勢股戰情室 V18 (純永豐最終版)
 # V2~V16: 歷史更新與 Bug 修正
 # V17_beta: 新增「🔧 系統診斷」分頁
 # V18: 🚀 終極進化版
-#      - 完全移除 twstock 依賴，根除盤中不穩定、擋 IP 等問題。
-#      - 全面導入 永豐金 Shioaji API 作為唯一即時報價與股票清單引擎。
-#      - 盤中掃描速度從數十秒縮減至 1~2 秒鐘，享受企業級零延遲報價。
+#      - 完全移除 twstock 與 證交所盤後 API 依賴。
+#      - 全面導入 永豐金 Shioaji API 作為 24H 唯一報價引擎。
+#      - 解決盤後 API 報錯導致策略全部無資料跳過的問題。
 #      - 全面修正 UTC 時區問題，確保所有時間均為台灣時間 (Asia/Taipei)。
 # ==========================================
 import streamlit as st
@@ -69,19 +69,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Streamlit Cloud SSL patch
-import ssl as _ssl_patch
-_ssl_patch._create_default_https_context = _ssl_patch._create_unverified_context
-
-import requests as _requests
-import urllib3 as _urllib3
-_urllib3.disable_warnings(_urllib3.exceptions.InsecureRequestWarning)
-_orig_request = _requests.Session.request
-def _unverified_request(self, method, url, **kwargs):
-    kwargs.setdefault('verify', False)
-    return _orig_request(self, method, url, **kwargs)
-_requests.Session.request = _unverified_request
-
 # --- 強制台灣時區 ---
 import pytz as _pytz_main
 _TW_TZ = _pytz_main.timezone("Asia/Taipei")
@@ -129,19 +116,6 @@ def get_shioaji_api():
 
 # 取得全局 API 實例
 api = get_shioaji_api()
-
-# ==========================================
-# 🕐 交易時段判斷
-# ==========================================
-def is_trading_hours():
-    now = _now_tw()
-    if now.weekday() >= 5: return False
-    market_open = now.replace(hour=9, minute=0, second=0, microsecond=0)
-    market_close = now.replace(hour=13, minute=30, second=0, microsecond=0)
-    return market_open <= now <= market_close
-
-def get_cache_ttl():
-    return 300 if is_trading_hours() else 3600
 
 # ==========================================
 # 🧠 策略核心邏輯類別 (Backtesting用)
@@ -229,37 +203,24 @@ class SniperStrategy(Strategy):
 # 🛠️ 輔助函式與資料庫 (Shioaji 版)
 # ==========================================
 def get_detailed_sector(code, standard_group=None, custom_db=None):
-    """取得產業分類 (優先使用自訂庫，其次使用 Shioaji 分類)"""
     code_str = str(code).strip()
-    if custom_db and code_str in custom_db:
-        return str(custom_db[code_str])
-    if standard_group and str(standard_group) not in ['nan', 'None', '', 'NaN']:
-        return str(standard_group)
+    if custom_db and code_str in custom_db: return str(custom_db[code_str])
+    if standard_group and str(standard_group) not in ['nan', 'None', '', 'NaN']: return str(standard_group)
     return "其他"
 
 @st.cache_data(ttl=3600*24)
 def get_stock_info_map(_api_instance):
-    """透過 Shioaji 取得全台股上市加上櫃清單"""
     stock_map = {}
     try:
-        # 歷遍所有股票合約
         for contract in _api_instance.Contracts.Stocks:
             code = contract.code
-            # 過濾：只抓 4 碼的純股票，排除權證、ETN 等
             if len(code) == 4 and code.isdigit():
                 suffix = ".TW" if contract.exchange == "TSE" else ".TWO"
-                stock_map[code] = {
-                    'name': f"{code} {contract.name}",
-                    'symbol': f"{code}{suffix}",
-                    'short_name': contract.name,
-                    'group': contract.category
-                }
-    except Exception as e:
-        logger.error(f"Shioaji 取得股票清單失敗: {e}")
+                stock_map[code] = {'name': f"{code} {contract.name}", 'symbol': f"{code}{suffix}", 'short_name': contract.name, 'group': contract.category}
+    except Exception as e: logger.error(f"Shioaji 取得股票清單失敗: {e}")
     return stock_map
 
 def get_stock_data_with_realtime(code, symbol, analysis_date_str, _api_instance):
-    """取得個股歷史資料，並用 Shioaji 補上最新一筆即時快照"""
     try:
         ticker = yf.Ticker(symbol)
         df = ticker.history(period="2y")
@@ -279,17 +240,9 @@ def get_stock_data_with_realtime(code, symbol, analysis_date_str, _api_instance)
                     snap = snapshots[0]
                     c_p = snap.close if snap.close > 0 else snap.previous_close
                     if c_p > 0:
-                        new_row = pd.Series({
-                            'Open': snap.open if snap.open > 0 else c_p,
-                            'High': snap.high if snap.high > 0 else c_p,
-                            'Low': snap.low if snap.low > 0 else c_p,
-                            'Close': c_p,
-                            'Volume': snap.total_volume * 1000
-                        }, name=pd.Timestamp(today_str))
+                        new_row = pd.Series({'Open': snap.open if snap.open > 0 else c_p, 'High': snap.high if snap.high > 0 else c_p, 'Low': snap.low if snap.low > 0 else c_p, 'Close': c_p, 'Volume': snap.total_volume * 1000}, name=pd.Timestamp(today_str))
                         df = pd.concat([df, new_row.to_frame().T])
-        except Exception as e:
-            logger.warning(f"Shioaji 即時資料補齊失敗 [{code}]: {e}")
-            
+        except Exception as e: logger.warning(f"Shioaji 即時資料補齊失敗 [{code}]: {e}")
     return df
 
 # ==========================================
@@ -521,111 +474,56 @@ def fetch_data_batch(stock_map, period="300d", chunk_size=150):
     return data_store
 
 # ==========================================
-# ⚡ 盤中即時報價 (純 Shioaji 極速版)
+# ⚡ 全時段即時報價 (100% 純 Shioaji API)
 # ==========================================
 def fetch_realtime_batch(codes_list, _api_instance, status_text=None):
-    """使用永豐金 Shioaji API 獲取極速盤中快照"""
-    import json as _json
-    import urllib.request
-    
+    """
+    不分盤中或盤後，一律使用永豐金 Shioaji API 獲取極速快照
+    徹底拔除所有不穩定的證交所與櫃買盤後 API！
+    """
     realtime_data = {}
     _txt = status_text if status_text else st.sidebar.empty()
 
-    now         = _now_tw()
-    is_intraday = datetime.time(9, 0) <= now.time() <= datetime.time(13, 35)
-
-    if is_intraday:
-        logger.info("盤中模式：使用永豐金 Shioaji API 即時報價")
-        rt_bar = st.sidebar.progress(0)
+    logger.info("全時段模式：使用永豐金 Shioaji API 獲取報價快照")
+    rt_bar = st.sidebar.progress(0)
+    
+    try:
+        # 準備合約列表
+        contracts = [_api_instance.Contracts.Stocks.get(c) for c in codes_list if _api_instance.Contracts.Stocks.get(c)]
+        total_c = len(contracts)
         
-        try:
-            # 準備合約列表
-            contracts = [_api_instance.Contracts.Stocks.get(c) for c in codes_list if _api_instance.Contracts.Stocks.get(c)]
-            total_c = len(contracts)
+        if total_c > 0:
+            _txt.text(f"⚡ 永豐金快照擷取中 (共 {total_c} 支)...")
             
-            if total_c > 0:
-                _txt.text(f"⚡ 永豐金快照擷取中 (共 {total_c} 支)...")
+            # 為了避免一次塞太多，稍微切成每批 300 檔送出快照請求
+            chunk_size = 300
+            for i in range(0, total_c, chunk_size):
+                chunk = contracts[i:i + chunk_size]
+                snapshots = _api_instance.snapshots(chunk)
                 
-                # 為了避免一次塞太多，稍微切成每批 300 檔送出快照請求 (Shioaji 效能極高，300 瞬間就回來)
-                chunk_size = 300
-                for i in range(0, total_c, chunk_size):
-                    chunk = contracts[i:i + chunk_size]
-                    snapshots = _api_instance.snapshots(chunk)
+                for snap in snapshots:
+                    c = snap.code
+                    # 防呆處理：開盤前可能為 0
+                    c_price = snap.close if snap.close > 0 else snap.previous_close
                     
-                    for snap in snapshots:
-                        c = snap.code
-                        # 防呆處理：開盤前可能為 0
-                        c_price = snap.close if snap.close > 0 else snap.previous_close
-                        
-                        realtime_data[c] = {
-                            "latest_trade_price": str(c_price),
-                            "open":   str(snap.open if snap.open > 0 else c_price),
-                            "high":   str(snap.high if snap.high > 0 else c_price),
-                            "low":    str(snap.low if snap.low > 0 else c_price),
-                            "accumulate_trade_volume": str(int(snap.total_volume))
-                        }
-                    
-                    pct = min(100, int((i + chunk_size) / total_c * 100))
-                    rt_bar.progress(pct)
-                
-            rt_bar.progress(100)
-            _txt.text(f"✅ 盤中即時盤 (永豐金) 完成｜取得 {len(realtime_data)} 支")
-            
-        except Exception as e:
-            logger.error(f"Shioaji 錯誤: {e}")
-            _txt.text(f"❌ 永豐金連線異常: {e}")
-            rt_bar.progress(100)
-
-    else:
-        # ── 盤後：仍使用證交所/櫃買 STOCK_DAY_ALL（一次全拿，確保有精確收盤價）──
-        logger.info("盤後模式：使用證交所/櫃買收盤資料")
-        import ssl as _ssl
-        _ctx = _ssl.create_default_context()
-        _ctx.check_hostname = False
-        _ctx.verify_mode = _ssl.CERT_NONE
-
-        try:
-            _txt.text("⚡ 取得收盤報價（證交所）...")
-            twse_url = "https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL?response=json"
-            import requests as _req_twse
-            resp_twse = _req_twse.get(twse_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10, verify=False, allow_redirects=True)
-            d = resp_twse.json()
-            if d.get("stat") == "OK" and d.get("data"):
-                fields = d["fields"]
-                fi = {f: idx for idx, f in enumerate(fields)}
-                def _n(s): return float(str(s).replace(",","").replace("+","").replace("--","0")) if str(s) not in ("--","") else 0.0
-                for row in d["data"]:
-                    try:
-                        c = row[fi["證券代號"]].strip()
-                        realtime_data[c] = {
-                            "latest_trade_price": str(_n(row[fi["收盤價"]])),
-                            "open":   str(_n(row[fi["開盤價"]])),
-                            "high":   str(_n(row[fi["最高價"]])),
-                            "low":    str(_n(row[fi["最低價"]])),
-                            "accumulate_trade_volume": str(int(_n(row[fi["成交股數"]]) / 1000)),
-                        }
-                    except Exception: continue
-        except Exception: pass
-
-        try:
-            _txt.text("⚡ 取得收盤報價（櫃買中心）...")
-            tpex_url = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes"
-            req = urllib.request.Request(tpex_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=10, context=_ctx) as r:
-                rows = _json.loads(r.read())
-            def _n2(s): return float(str(s).replace(",","")) if str(s) not in ("--","","N/A") else 0.0
-            for row in rows:
-                try:
-                    c = str(row.get("SecuritiesCompanyCode","")).strip()
                     realtime_data[c] = {
-                        "latest_trade_price": str(_n2(row.get("Close","0"))),
-                        "open":   str(_n2(row.get("Open","0"))),
-                        "high":   str(_n2(row.get("High","0"))),
-                        "low":    str(_n2(row.get("Low","0"))),
-                        "accumulate_trade_volume": str(int(_n2(row.get("TradeVolume","0")) / 1000)),
+                        "latest_trade_price": str(c_price),
+                        "open":   str(snap.open if snap.open > 0 else c_price),
+                        "high":   str(snap.high if snap.high > 0 else c_price),
+                        "low":    str(snap.low if snap.low > 0 else c_price),
+                        "accumulate_trade_volume": str(int(snap.total_volume))
                     }
-                except Exception: continue
-        except Exception: pass
+                
+                pct = min(100, int((i + chunk_size) / total_c * 100))
+                rt_bar.progress(pct)
+            
+        rt_bar.progress(100)
+        _txt.text(f"✅ 報價快照 (永豐金) 更新完成｜成功取得 {len(realtime_data)} 支")
+        
+    except Exception as e:
+        logger.error(f"Shioaji 快照抓取錯誤: {e}")
+        _txt.text(f"❌ 永豐金連線異常: {e}")
+        rt_bar.progress(100)
 
     return realtime_data
 
@@ -663,7 +561,6 @@ def fetch_disposal_stocks():
         parts = s.strip().replace('/', '-').split('-')
         return datetime.date(int(parts[0].strip()) + 1911, int(parts[1].strip()), int(parts[2].strip()))
     try:
-        # 修正：使用自訂的台灣時區函數取代 datetime.date.today()，確保時區絕對正確
         today_dt = _now_tw().date()
         url = f"https://www.twse.com.tw/rwd/zh/announcement/punish?response=json&startDate={(today_dt - datetime.timedelta(days=30)).strftime('%Y%m%d')}&endDate={(today_dt + datetime.timedelta(days=30)).strftime('%Y%m%d')}"
         res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15, verify=False)
@@ -941,7 +838,7 @@ def run_backtest_ui(df, stock_input, params):
 # 🖥️ 介面主程式
 # ==========================================
 st.sidebar.title("🔥 強勢股戰情室 V18")
-st.sidebar.caption("純永豐金 API 企業級專線連線版")
+st.sidebar.caption("純永豐金 API 企業級 24H 連線版")
 
 if os.path.exists(PARQUET_PATH):
     try:
@@ -950,9 +847,7 @@ if os.path.exists(PARQUET_PATH):
     except Exception: st.sidebar.success("📂 歷史資料：Parquet ✅")
 else: st.sidebar.warning("⚠️ 未找到 data/history.parquet，將使用 yfinance 下載")
 
-if is_trading_hours():
-    st.sidebar.success("🟢 盤中模式 (永豐金 Shioaji 專線極速連線)")
-else: st.sidebar.caption("🔵 盤後模式 (1小時快取)")
+st.sidebar.success("🟢 Shioaji 全時段連線中")
 
 # 側邊欄日期修正：確保無論主機在哪裡，預設都是台灣時間的「今天」
 analysis_date_input = st.sidebar.date_input("分析基準日", _now_tw().date())
@@ -1047,8 +942,10 @@ if start_scan:
 
     today_str = _now_tw().strftime('%Y-%m-%d')
     realtime_map = {}
+    
+    # ── 終極版修改：不管是盤中還是盤後，一律跟 Shioaji 討快照 ──
     if analysis_date_str == today_str:
-        status_text.text("⚡ 正在請求永豐金 Shioaji 極速盤中快照...")
+        status_text.text("⚡ 正在請求永豐金 Shioaji 報價快照...")
         realtime_map = fetch_realtime_batch(list(history_data_store.keys()), api, status_text=status_text)
 
     status_text.text("🧠 正在進行大盤與波段策略運算...")
@@ -1345,17 +1242,8 @@ with tab6:
             except Exception as e:
                 st.error(f"❌ Shioaji 發生錯誤: {e}")
 
-        # 2. 證交所 API
-        st.subheader("2. 證交所盤後 API")
-        with st.spinner("檢查證交所 API..."):
-            try:
-                d = _requests.get("https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL?response=json", headers={"User-Agent": "Mozilla/5.0"}, timeout=10, verify=False).json()
-                if d.get("stat") == "OK" and d.get("data"): st.success(f"✅ 證交所 API 正常 | 回傳 {len(d.get('data'))} 筆")
-                else: st.warning(f"⚠️ API 回傳無資料 stat={d.get('stat')}（盤中時段正常）")
-            except Exception as e: st.error(f"❌ 證交所 API 錯誤: {e}")
-
-        # 3. Parquet 歷史資料
-        st.subheader("3. 歷史資料 data/history.parquet")
+        # 2. Parquet 歷史資料
+        st.subheader("2. 歷史資料 data/history.parquet")
         if os.path.exists(PARQUET_PATH):
             try:
                 df_check = pd.read_parquet(PARQUET_PATH); df_check["date"] = pd.to_datetime(df_check["date"])
