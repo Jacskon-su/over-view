@@ -9,6 +9,7 @@
 #      - 全面修正 UTC 時區問題，確保所有時間均為台灣時間 (Asia/Taipei)。
 #      - (修復) 修正大盤無資料時的字串格式化 ValueError。
 #      - (修復) 修正 Shioaji Contracts 遍歷方式，確保股票清單與掃描正常執行。
+#      - (優化) 大盤指數結合歷史資料與 Shioaji API (TSE001) 即時快照，達成零延遲。
 # ==========================================
 import streamlit as st
 import os
@@ -544,25 +545,58 @@ def fetch_realtime_batch(codes_list, _api_instance, status_text=None):
 # 📈 大盤狀態與處置股模組 
 # ==========================================
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_market_status(analysis_date_str):
+def fetch_market_status(analysis_date_str, _api_instance=None):
     try:
+        # 1. 先用 yfinance 獲取大盤歷史資料庫算 MA
         tw = yf.Ticker("^TWII")
         df = tw.history(period="1y")
         if df.empty or df.index.tz is not None: df.index = df.index.tz_localize(None) if not df.empty else df.index
         if df.empty: return {'strong': True, 'score': 5, 'label': '無法取得大盤資料'}
+        
+        today_str = _now_tw().strftime('%Y-%m-%d')
+        
+        # 2. 如果是今天，使用永豐金 API 抓取加權指數 (TSE001) 即時快照，覆寫最新報價
+        realtime_close = None
+        if _api_instance and analysis_date_str == today_str:
+            try:
+                contract = _api_instance.Contracts.Indices.TSE.TSE001
+                snapshots = _api_instance.snapshots([contract])
+                if snapshots:
+                    snap = snapshots[0]
+                    realtime_close = snap.close if snap.close > 0 else snap.previous_close
+            except Exception as e:
+                logger.warning(f"Shioaji 大盤快照獲取失敗: {e}")
+        
+        # 若成功取得 Shioaji 最新指數，則將它塞入或更新到 df 中
+        if realtime_close is not None and realtime_close > 0:
+            if df.index[-1].strftime('%Y-%m-%d') == today_str:
+                df.iloc[-1, df.columns.get_loc('Close')] = realtime_close
+            else:
+                new_row = pd.Series({'Close': realtime_close}, name=pd.Timestamp(today_str))
+                df = pd.concat([df, new_row.to_frame().T])
+
         df['DateStr'] = df.index.strftime('%Y-%m-%d')
         latest_idx = df.index.get_loc(pd.Timestamp(analysis_date_str)) if analysis_date_str in df['DateStr'].values else -1
-        close = df['Close']; ma20 = close.rolling(20).mean(); ma60 = close.rolling(60).mean()
+        
+        close = df['Close'].ffill() # 防呆：避免出現 NaN
+        ma20 = close.rolling(20).mean()
+        ma60 = close.rolling(60).mean()
+        
         c = close.iloc[latest_idx]; m20 = ma20.iloc[latest_idx]; m60 = ma60.iloc[latest_idx]
+        
         score = 0
         if c > m20:  score += 4
         if c > m60:  score += 3
         if m20 > m60: score += 3
+        
         if score >= 7: label = "🟢 大盤強勢"
         elif score >= 4: label = "🟡 大盤偏弱"
         else: label = "🔴 大盤弱勢"
+        
         return {'strong': score >= 7, 'score': score, 'label': label, 'close': round(c, 0), 'ma20': round(m20, 0), 'ma60': round(m60, 0)}
-    except Exception: return {'strong': True, 'score': 5, 'label': '大盤資料異常'}
+    except Exception as e: 
+        logger.error(f"大盤狀態計算錯誤: {e}")
+        return {'strong': True, 'score': 5, 'label': '大盤資料異常'}
 
 def is_valid_stock_code(code):
     return bool(code and code.isdigit() and len(code) == 4 and int(code) < 9000)
@@ -935,7 +969,7 @@ def params_changed():
 if start_scan:
     stock_map = get_stock_info_map(api)
     status_text.text("📈 正在判斷大盤狀態...")
-    market_status = fetch_market_status(analysis_date_str)
+    market_status = fetch_market_status(analysis_date_str, api) # 傳入 api 實例以抓取大盤快照
     st.session_state['market_status'] = market_status
 
     sniper_triggered = []; sniper_setup = []; sniper_watching = []; day_candidates = []; failed_list = []
