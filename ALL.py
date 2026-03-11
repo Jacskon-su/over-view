@@ -398,10 +398,11 @@ def fetch_realtime_batch(codes_list, _api_instance, status_text=None):
         contracts = []
         for c in codes_list:
             c_str = str(c)
-            # 🔧 增強: 更安全的合約抓取方式
-            contract = _api_instance.Contracts.Stocks.get(c_str)
+            # TSE（上市）優先，找不到再查 OTC（上櫃）
+            contract = (_api_instance.Contracts.Stocks.TSE.get(c_str)
+                        or _api_instance.Contracts.Stocks.OTC.get(c_str))
             if contract: contracts.append(contract)
-            
+
         total_c = len(contracts)
         if total_c > 0:
             _txt.text(f"⚡ 永豐金快照擷取中 (共 {total_c} 支)...")
@@ -414,9 +415,52 @@ def fetch_realtime_batch(codes_list, _api_instance, status_text=None):
                         "high": str(snap.high if snap.high > 0 else c_price), "low": str(snap.low if snap.low > 0 else c_price),
                         "accumulate_trade_volume": str(int(snap.total_volume))
                     }
-                rt_bar.progress(min(100, int((i + 300) / total_c * 100)))
-            
-        rt_bar.progress(100); _txt.text(f"✅ 報價快照 (永豐金) 更新完成｜成功取得 {len(realtime_data)} 支")
+                rt_bar.progress(min(50, int((i + 300) / total_c * 50)))
+
+        # simulation 模式合約不完整，用證交所/櫃買 API 補齊缺漏
+        missing_codes = set(str(c) for c in codes_list) - set(realtime_data.keys())
+        if missing_codes:
+            logger.info(f"永豐金未涵蓋 {len(missing_codes)} 支，改用證交所/櫃買補齊")
+            _txt.text(f"⚡ 補齊缺漏報價（證交所/櫃買）{len(missing_codes)} 支...")
+            import requests as _rq
+            try:
+                r = _rq.get("https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL?response=json",
+                            headers={"User-Agent": "Mozilla/5.0"}, timeout=10, verify=False, allow_redirects=True)
+                d = r.json()
+                if d.get("stat") == "OK" and d.get("data"):
+                    fi = {f: idx for idx, f in enumerate(d["fields"])}
+                    def _n(s): return float(str(s).replace(",","").replace("+","").replace("--","0")) if str(s) not in ("--","") else 0.0
+                    for row in d["data"]:
+                        c = row[fi["證券代號"]].strip()
+                        if c in missing_codes:
+                            realtime_data[c] = {
+                                "latest_trade_price": str(_n(row[fi["收盤價"]])),
+                                "open": str(_n(row[fi["開盤價"]])), "high": str(_n(row[fi["最高價"]])),
+                                "low": str(_n(row[fi["最低價"]])),
+                                "accumulate_trade_volume": str(int(_n(row[fi["成交股數"]]) / 1000)),
+                            }
+            except Exception as e:
+                logger.warning(f"證交所補齊失敗: {e}")
+            try:
+                rows = _rq.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes",
+                               headers={"User-Agent": "Mozilla/5.0"}, timeout=10, verify=False).json()
+                def _n2(s): return float(str(s).replace(",","")) if str(s) not in ("--","","N/A") else 0.0
+                for row in rows:
+                    c = str(row.get("SecuritiesCompanyCode","")).strip()
+                    if c in missing_codes:
+                        realtime_data[c] = {
+                            "latest_trade_price": str(_n2(row.get("Close","0"))),
+                            "open": str(_n2(row.get("Open","0"))), "high": str(_n2(row.get("High","0"))),
+                            "low": str(_n2(row.get("Low","0"))),
+                            "accumulate_trade_volume": str(int(_n2(row.get("TradingShares","0")) / 1000)),
+                        }
+            except Exception as e:
+                logger.warning(f"櫃買補齊失敗: {e}")
+
+        rt_bar.progress(100)
+        sj_cnt = total_c
+        補齊_cnt = len(realtime_data) - sj_cnt
+        _txt.text(f"✅ 報價更新完成｜永豐金 {sj_cnt} 支 + 補齊 {補齊_cnt} 支｜共 {len(realtime_data)} 支")
     except Exception as e:
         logger.error(f"Shioaji 快照抓取錯誤: {e}"); _txt.text(f"❌ 永豐金連線異常: {e}"); rt_bar.progress(100)
     return realtime_data
@@ -761,8 +805,8 @@ if start_scan:
         history_data_store = fetch_data_batch(stock_map)
     else:
         status_text.text(load_msg)
-        # 🔧 防護：確保 history_data_store 的 Key 與 stock_map 的 Key 同為字串，避免被過濾空！
-        history_data_store = {str(k): v for k, v in history_data_store.items() if str(k) in stock_map}
+        # 🔧 防護：統一轉為字串 key，不以 stock_map 過濾（simulation 模式合約不完整會漏掉上櫃）
+        history_data_store = {str(k): v for k, v in history_data_store.items()}
 
     st.session_state['all_data_cache']   = history_data_store
     st.session_state['stock_map_cache']  = stock_map
