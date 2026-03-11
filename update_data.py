@@ -11,6 +11,12 @@ import os
 import time
 from datetime import datetime, timedelta
 
+try:
+    import twstock
+except ImportError:
+    print("❌ 請先安裝 twstock：pip install twstock")
+    exit(1)
+
 # ==========================================
 # 設定
 # ==========================================
@@ -25,63 +31,13 @@ SLEEP_SEC   = 2
 # 取得全台股清單
 # ==========================================
 def get_stock_map():
-    """
-    從永豐金 Shioaji 合約取得股票清單（含新上市/上櫃）
-    需要在環境變數或 .env 設定 SJ_API_KEY / SJ_SECRET_KEY
-    若永豐登入失敗，自動 fallback 到證交所/櫃買 OpenAPI
-    """
     stock_map = {}
-
-    # ── 方法一：永豐金 Shioaji 合約（最完整）──
-    sj_api_key    = os.environ.get("SJ_API_KEY", "")
-    sj_secret_key = os.environ.get("SJ_SECRET_KEY", "")
-
-    if sj_api_key and sj_secret_key:
-        try:
-            import shioaji as sj
-            api = sj.Shioaji(simulation=True)
-            api.login(api_key=sj_api_key, secret_key=sj_secret_key, fetch_contract=True)
-            for c in api.Contracts.Stocks.TSE:
-                if len(c.code) == 4 and c.code.isdigit():
-                    stock_map[c.code] = {"symbol": f"{c.code}.TW", "name": c.name, "market": "TWSE"}
-            for c in api.Contracts.Stocks.OTC:
-                if len(c.code) == 4 and c.code.isdigit():
-                    stock_map[c.code] = {"symbol": f"{c.code}.TWO", "name": c.name, "market": "TPEX"}
-            try:
-                api.logout()
-            except Exception:
-                pass
-            print(f"   永豐合約：共 {len(stock_map)} 支")
-            return stock_map
-        except Exception as e:
-            print(f"   ⚠️  永豐登入失敗（{e}），改用 OpenAPI fallback")
-
-    # ── 方法二：證交所 / 櫃買 OpenAPI（fallback）──
-    import requests
-    try:
-        r = requests.get(
-            "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
-            headers={"User-Agent": "Mozilla/5.0"}, timeout=15
-        )
-        for row in r.json():
-            code = str(row.get("Code", "")).strip()
-            if len(code) == 4 and code.isdigit():
-                stock_map[code] = {"symbol": f"{code}.TW", "name": row.get("Name", ""), "market": "TWSE"}
-    except Exception as e:
-        print(f"   ⚠️  證交所 OpenAPI 失敗: {e}")
-    try:
-        r = requests.get(
-            "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes",
-            headers={"User-Agent": "Mozilla/5.0"}, timeout=15
-        )
-        for row in r.json():
-            code = str(row.get("SecuritiesCompanyCode", "")).strip()
-            if len(code) == 4 and code.isdigit():
-                stock_map[code] = {"symbol": f"{code}.TWO", "name": row.get("CompanyName", ""), "market": "TPEX"}
-    except Exception as e:
-        print(f"   ⚠️  櫃買 OpenAPI 失敗: {e}")
-
-    print(f"   OpenAPI fallback：共 {len(stock_map)} 支")
+    for code, info in twstock.twse.items():
+        if len(code) == 4 and code.isdigit():
+            stock_map[code] = {"symbol": f"{code}.TW",  "name": info.name, "market": "TWSE"}
+    for code, info in twstock.tpex.items():
+        if len(code) == 4 and code.isdigit():
+            stock_map[code] = {"symbol": f"{code}.TWO", "name": info.name, "market": "TPEX"}
     return stock_map
 
 # ==========================================
@@ -151,37 +107,52 @@ def main():
     print(f"   現有資料最新日期：{last_date.date()}")
     print(f"   現有筆數：{len(existing):,}")
 
-    # ── 判斷需要下載的範圍 ──
-    start_date = (last_date + timedelta(days=1)).strftime("%Y-%m-%d")
-    end_date   = (datetime.today() + timedelta(days=1)).strftime("%Y-%m-%d")
-
-    if start_date > today:
-        print(f"\n✅ 資料已是最新（{last_date.date()}），不需要更新")
-        return
-
-    print(f"   需要下載範圍：{start_date} ～ {today}")
-
     # ── 取得股票清單 ──
     print("\n📋 取得股票清單...")
     stock_map   = get_stock_map()
     symbols     = [info["symbol"] for info in stock_map.values()]
     sym_to_code = {v["symbol"]: k for k, v in stock_map.items()}
-    print(f"   共 {len(symbols)} 支")
+    existing_codes = set(existing["code"].unique())
+    new_codes = [code for code in stock_map if code not in existing_codes]
+    print(f"   共 {len(symbols)} 支，其中新股 {len(new_codes)} 支（parquet 沒有）")
 
-    # ── 批量下載新資料 ──
-    print(f"\n📥 開始下載新資料（每批 {CHUNK_SIZE} 支）...")
     all_dfs = {}
-    chunks  = [symbols[i:i+CHUNK_SIZE] for i in range(0, len(symbols), CHUNK_SIZE)]
-    total   = len(chunks)
 
-    for idx, batch in enumerate(chunks, 1):
-        pct = idx / total * 100
-        print(f"  [{idx:3d}/{total}] {pct:5.1f}%  下載 {len(batch)} 支...", end="  ")
-        batch_data = download_batch(batch, start_date, end_date)
-        all_dfs.update(batch_data)
-        print(f"取得 {len(batch_data)} 支")
-        if idx < total:
-            time.sleep(SLEEP_SEC)
+    # ── 補齊新股完整歷史 ──
+    if new_codes:
+        new_symbols = [stock_map[c]["symbol"] for c in new_codes]
+        cutoff_str  = (datetime.today() - timedelta(days=KEEP_DAYS)).strftime("%Y-%m-%d")
+        end_date_new = (datetime.today() + timedelta(days=1)).strftime("%Y-%m-%d")
+        print(f"\n🆕 補齊新股歷史（{len(new_codes)} 支，從 {cutoff_str} 起）...")
+        chunks_new = [new_symbols[i:i+CHUNK_SIZE] for i in range(0, len(new_symbols), CHUNK_SIZE)]
+        for idx, batch in enumerate(chunks_new, 1):
+            print(f"  [{idx}/{len(chunks_new)}] 下載 {len(batch)} 支新股...", end="  ")
+            batch_data = download_batch(batch, cutoff_str, end_date_new)
+            all_dfs.update(batch_data)
+            print(f"取得 {len(batch_data)} 支")
+            if idx < len(chunks_new):
+                time.sleep(SLEEP_SEC)
+
+    # ── 判斷需要下載的日期增量 ──
+    start_date = (last_date + timedelta(days=1)).strftime("%Y-%m-%d")
+    end_date   = (datetime.today() + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    if start_date > today and not new_codes:
+        print(f"\n✅ 資料已是最新（{last_date.date()}），不需要更新")
+        return
+
+    if start_date <= today:
+        print(f"\n📥 下載增量資料（{start_date} ～ {today}，每批 {CHUNK_SIZE} 支）...")
+        chunks  = [symbols[i:i+CHUNK_SIZE] for i in range(0, len(symbols), CHUNK_SIZE)]
+        total_c = len(chunks)
+        for idx, batch in enumerate(chunks, 1):
+            pct = idx / total_c * 100
+            print(f"  [{idx:3d}/{total_c}] {pct:5.1f}%  下載 {len(batch)} 支...", end="  ")
+            batch_data = download_batch(batch, start_date, end_date)
+            all_dfs.update(batch_data)
+            print(f"取得 {len(batch_data)} 支")
+            if idx < total_c:
+                time.sleep(SLEEP_SEC)
 
     if not all_dfs:
         print("\n⚠️  今日無新資料（可能是假日或收盤資料尚未更新）")
