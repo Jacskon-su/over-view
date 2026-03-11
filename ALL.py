@@ -8,7 +8,6 @@
 #      - (修復) 修正大盤無資料時的字串格式化 ValueError。
 #      - (修復) 解決 Parquet 型態與 API 型態不一致導致股票被清空的 Bug。
 #      - (修復) 加入 Pandas Index 去重防呆，完美解決盤中快照寫入失敗/報錯的問題。
-#      - (修復) 優化股票清單抓取邏輯，確保抓取全市場所有符合條件的股票。
 # ==========================================
 import streamlit as st
 import os
@@ -189,20 +188,17 @@ def get_detailed_sector(code, standard_group=None, custom_db=None):
 def get_stock_info_map(_api_instance):
     stock_map = {}
     try:
-        # 🔧 修改：直接遍歷 Contracts.Stocks，它是一個包含所有股票的清單
-        for contract in _api_instance.Contracts.Stocks:
-            code = contract.code
-            # 放寬條件，確保抓到所有 4 碼純數字的股票
-            if isinstance(code, str) and len(code) == 4 and code.isdigit():
-                suffix = ".TW" if contract.exchange == "TSE" else ".TWO"
-                stock_map[str(code)] = {
-                    'name': f"{code} {contract.name}", 
-                    'symbol': f"{code}{suffix}", 
-                    'short_name': contract.name, 
-                    'group': getattr(contract, 'category', '其他')
-                }
-    except Exception as e: 
-        logger.error(f"Shioaji 取得股票清單失敗: {e}")
+        for exchange in [_api_instance.Contracts.Stocks.TSE, _api_instance.Contracts.Stocks.OTC]:
+            for contract in exchange:
+                code = contract.code
+                if len(code) == 4 and code.isdigit():
+                    stock_map[str(code)] = {
+                        'name': f"{code} {contract.name}", 
+                        'symbol': f"{code}{'.TW' if contract.exchange == 'TSE' else '.TWO'}", 
+                        'short_name': contract.name, 
+                        'group': getattr(contract, 'category', '其他')
+                    }
+    except Exception as e: logger.error(f"Shioaji 取得股票清單失敗: {e}")
     return stock_map
 
 def get_stock_data_with_realtime(code, symbol, analysis_date_str, _api_instance):
@@ -285,17 +281,6 @@ def bull_calc_indicators(df, params):
     df["Vol_Heavy"] = volume.rolling(params["vol_heavy_days"]).mean()
     df["Vol_Shrink"] = volume.rolling(params["vol_shrink_days"]).mean()
     return df
-
-def bull_check_entry(df, params):
-    if len(df) < params["boll_period"] + params["squeeze_n"]: return False
-    r = df.iloc[-1]
-    if pd.isna(r["Squeeze_Recent"]) or pd.isna(r["Vol_MA20"]): return False
-    squeeze  = bool(r["Squeeze_Recent"])
-    sma_up   = bool(r["SMA_Up"])
-    breakout = float(r["Close"]) > float(r["Upper"])
-    vol_ok   = float(r["Volume"]) > float(r["Vol_MA"]) * params["vol_ratio"]
-    min_vol  = float(r["Vol_MA20"]) > params["min_vol_shares"]
-    return squeeze and sma_up and breakout and vol_ok and min_vol
 
 def bull_scan_one(code, info, df_raw, params, pos_map, scan_date_ts):
     result = {"entry": None, "addon_a": None, "addon_b": None, "exit": None, "high_update": None}
@@ -413,8 +398,9 @@ def fetch_realtime_batch(codes_list, _api_instance, status_text=None):
         contracts = []
         for c in codes_list:
             c_str = str(c)
-            # 🔧 增強: 更安全的合約抓取方式
-            contract = _api_instance.Contracts.Stocks.get(c_str)
+            # TSE（上市）優先，找不到再查 OTC（上櫃）
+            contract = (_api_instance.Contracts.Stocks.TSE.get(c_str)
+                        or _api_instance.Contracts.Stocks.OTC.get(c_str))
             if contract: contracts.append(contract)
             
         total_c = len(contracts)
