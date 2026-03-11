@@ -1,15 +1,13 @@
 # ==========================================
-# 強勢股戰情室 V18 (純永豐最終版)
+# 強勢股戰情室 V18 (純永豐強護版)
 # V2~V16: 歷史更新與 Bug 修正
 # V17_beta: 新增「🔧 系統診斷」分頁
 # V18: 🚀 終極進化版
 #      - 完全移除 twstock 與 證交所盤後 API 依賴。
 #      - 全面導入 永豐金 Shioaji API 作為 24H 唯一報價引擎。
-#      - 解決盤後 API 報錯導致策略全部無資料跳過的問題。
-#      - 全面修正 UTC 時區問題，確保所有時間均為台灣時間 (Asia/Taipei)。
 #      - (修復) 修正大盤無資料時的字串格式化 ValueError。
-#      - (修復) 修正 Shioaji Contracts 遍歷方式，確保股票清單與掃描正常執行。
-#      - (優化) 大盤指數結合歷史資料與 Shioaji API (TSE001) 即時快照，達成零延遲。
+#      - (修復) 解決 Parquet 型態與 API 型態不一致導致股票被清空的 Bug。
+#      - (修復) 加入 Pandas Index 去重防呆，完美解決盤中快照寫入失敗/報錯的問題。
 # ==========================================
 import streamlit as st
 import os
@@ -110,15 +108,21 @@ def get_shioaji_api():
         api.login(
             api_key=st.secrets["shioaji"]["api_key"],
             secret_key=st.secrets["shioaji"]["secret_key"],
-            fetch_contract=True # 必須為 True 才能獲取全市場股票代號清單
+            fetch_contract=True
         )
         return api
     except Exception as e:
         st.error(f"🔴 永豐金 API 登入失敗: {e}")
         st.stop()
 
-# 取得全局 API 實例
 api = get_shioaji_api()
+
+def is_trading_hours():
+    now = _now_tw()
+    if now.weekday() >= 5: return False
+    market_open = now.replace(hour=9, minute=0, second=0, microsecond=0)
+    market_close = now.replace(hour=13, minute=30, second=0, microsecond=0)
+    return market_open <= now <= market_close
 
 # ==========================================
 # 🧠 策略核心邏輯類別 (Backtesting用)
@@ -139,68 +143,37 @@ class SniperStrategy(Strategy):
     defense_buffer = 0.01
 
     def init(self):
-        close = pd.Series(self.data.Close)
-        volume = pd.Series(self.data.Volume)
+        close = pd.Series(self.data.Close); volume = pd.Series(self.data.Volume)
         self.ma_trend = self.I(SMA, close, self.ma_trend_period)
         self.ma_base = self.I(SMA, close, self.ma_base_exit)
         self.ma_fast = self.I(SMA, close, self.ma_fast_exit)
         self.vol_ma = self.I(SMA, volume, self.vol_ma_period)
-        if self.use_year_line:
-            self.ma_long = self.I(SMA, close, self.ma_long_period)
-        self.setup_active = False
-        self.setup_bar_index = 0
-        self.setup_low_price = 0
-        self.defense_price = 0
+        if self.use_year_line: self.ma_long = self.I(SMA, close, self.ma_long_period)
+        self.setup_active = False; self.setup_bar_index = 0; self.setup_low_price = 0; self.defense_price = 0
 
     def next(self):
-        price = self.data.Close[-1]
-        prev_high = self.data.High[-2]
+        price = self.data.Close[-1]; prev_high = self.data.High[-2]
         if self.position:
             if price < self.defense_price:
-                self.position.close()
-                return
-            current_profit_pct = self.position.pl_pct
-            exit_line = self.ma_fast[-1] if current_profit_pct > 0.15 else self.ma_base[-1]
-            if price < exit_line:
-                self.position.close()
+                self.position.close(); return
+            exit_line = self.ma_fast[-1] if self.position.pl_pct > 0.15 else self.ma_base[-1]
+            if price < exit_line: self.position.close()
             return
 
         triggered_buy = False
-        days_since_setup = len(self.data) - self.setup_bar_index
         if self.setup_active:
-            if days_since_setup > self.lookback_window:
-                self.setup_active = False
-            elif price < self.defense_price:
-                self.setup_active = False
-            elif price > prev_high:
-                self.buy()
-                self.setup_active = False
-                triggered_buy = True
-                return
+            if len(self.data) - self.setup_bar_index > self.lookback_window or price < self.defense_price: self.setup_active = False
+            elif price > prev_high: self.buy(); self.setup_active = False; triggered_buy = True; return
 
         if not triggered_buy:
             if self.data.Volume[-1] < self.min_volume_shares: return
-            is_trend_up = (price > self.ma_trend[-1]) and (self.ma_trend[-1] > self.ma_trend[-2])
+            if not ((price > self.ma_trend[-1]) and (self.ma_trend[-1] > self.ma_trend[-2])): return
             if self.use_year_line and (pd.isna(self.ma_long[-1]) or price < self.ma_long[-1]): return
 
-            prev_close = self.data.Close[-2]
-            open_price = self.data.Open[-1]
-            change_pct = (price - prev_close) / prev_close
-            is_big = change_pct > self.big_candle_pct
-            is_vol = self.data.Volume[-1] > self.vol_ma[-1]
-            is_red = price > open_price
-
-            if is_trend_up and is_big and is_vol and is_red:
-                self.setup_active = True
-                self.setup_bar_index = len(self.data)
-                self.setup_low_price = self.data.Low[-1]
-                prev_high_setup = self.data.High[-2]
-                prev_close_setup = self.data.Close[-2]
-                if self.data.Low[-1] > prev_high_setup:
-                    base_val = prev_close_setup
-                else:
-                    base_val = self.data.Low[-1]
-                self.defense_price = base_val * (1 - self.defense_buffer)
+            is_big = (price - self.data.Close[-2]) / self.data.Close[-2] > self.big_candle_pct
+            if is_big and (self.data.Volume[-1] > self.vol_ma[-1]) and (price > self.data.Open[-1]):
+                self.setup_active = True; self.setup_bar_index = len(self.data); self.setup_low_price = self.data.Low[-1]
+                self.defense_price = (self.data.Close[-2] if self.data.Low[-1] > self.data.High[-2] else self.data.Low[-1]) * (1 - self.defense_buffer)
 
 # ==========================================
 # 🛠️ 輔助函式與資料庫 (Shioaji 版)
@@ -215,37 +188,31 @@ def get_detailed_sector(code, standard_group=None, custom_db=None):
 def get_stock_info_map(_api_instance):
     stock_map = {}
     try:
-        # 修正：分別遍歷 TSE(上市) 與 OTC(上櫃) 市場合約
         for exchange in [_api_instance.Contracts.Stocks.TSE, _api_instance.Contracts.Stocks.OTC]:
             for contract in exchange:
                 code = contract.code
                 if len(code) == 4 and code.isdigit():
-                    suffix = ".TW" if contract.exchange == "TSE" else ".TWO"
-                    stock_map[code] = {
+                    stock_map[str(code)] = {
                         'name': f"{code} {contract.name}", 
-                        'symbol': f"{code}{suffix}", 
+                        'symbol': f"{code}{'.TW' if contract.exchange == 'TSE' else '.TWO'}", 
                         'short_name': contract.name, 
                         'group': getattr(contract, 'category', '其他')
                     }
-    except Exception as e: 
-        logger.error(f"Shioaji 取得股票清單失敗: {e}")
+    except Exception as e: logger.error(f"Shioaji 取得股票清單失敗: {e}")
     return stock_map
 
 def get_stock_data_with_realtime(code, symbol, analysis_date_str, _api_instance):
     try:
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(period="2y")
+        df = yf.Ticker(symbol).history(period="2y")
         if df.empty: return None
         if df.index.tz is not None: df.index = df.index.tz_localize(None)
     except: return None
 
-    last_dt = df.index[-1].strftime('%Y-%m-%d')
     today_str = _now_tw().strftime('%Y-%m-%d')
-
-    if analysis_date_str == today_str and last_dt != today_str:
+    if analysis_date_str == today_str and df.index[-1].strftime('%Y-%m-%d') != today_str:
         try:
-            if code in _api_instance.Contracts.Stocks:
-                contract = _api_instance.Contracts.Stocks[code]
+            contract = _api_instance.Contracts.Stocks.get(str(code))
+            if contract:
                 snapshots = _api_instance.snapshots([contract])
                 if snapshots:
                     snap = snapshots[0]
@@ -253,7 +220,7 @@ def get_stock_data_with_realtime(code, symbol, analysis_date_str, _api_instance)
                     if c_p > 0:
                         new_row = pd.Series({'Open': snap.open if snap.open > 0 else c_p, 'High': snap.high if snap.high > 0 else c_p, 'Low': snap.low if snap.low > 0 else c_p, 'Close': c_p, 'Volume': snap.total_volume * 1000}, name=pd.Timestamp(today_str))
                         df = pd.concat([df, new_row.to_frame().T])
-        except Exception as e: logger.warning(f"Shioaji 即時資料補齊失敗 [{code}]: {e}")
+        except Exception: pass
     return df
 
 # ==========================================
@@ -271,13 +238,11 @@ def bull_get_ws():
     if not GSPREAD_AVAILABLE: return None
     try:
         creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=BULL_SCOPES)
-        gc = gspread.authorize(creds)
-        sh = gc.open_by_key(st.secrets["sheets"]["sheet_id"])
-        try: ws = sh.worksheet("bull_positions")
+        sh = gspread.authorize(creds).open_by_key(st.secrets["sheets"]["sheet_id"])
+        try: return sh.worksheet("bull_positions")
         except Exception:
             ws = sh.add_worksheet(title="bull_positions", rows=1000, cols=20)
-            ws.append_row(BULL_SHEET_COLS)
-        return ws
+            ws.append_row(BULL_SHEET_COLS); return ws
     except Exception: return None
 
 def bull_gs_load() -> pd.DataFrame:
@@ -287,71 +252,35 @@ def bull_gs_load() -> pd.DataFrame:
         data = ws.get_all_records()
         if not data: return pd.DataFrame(columns=BULL_SHEET_COLS)
         df = pd.DataFrame(data)
-        df["加碼次數"]  = pd.to_numeric(df["加碼次數"],  errors="coerce").fillna(0).astype(int)
-        df["進場價"]    = pd.to_numeric(df["進場價"],    errors="coerce").fillna(0)
-        df["上次加碼價"]= pd.to_numeric(df["上次加碼價"],errors="coerce").fillna(0)
-        df["持倉最高價"]= pd.to_numeric(df["持倉最高價"],errors="coerce").fillna(0)
+        for col in ["加碼次數", "進場價", "上次加碼價", "持倉最高價"]: df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
         return df[BULL_SHEET_COLS]
     except Exception: return pd.DataFrame(columns=BULL_SHEET_COLS)
 
 def bull_gs_save(df: pd.DataFrame):
-    ws = bull_get_ws()
-    if ws is None: return
-    try:
-        ws.clear()
-        ws.append_row(BULL_SHEET_COLS)
-        if len(df) > 0:
-            rows = df[BULL_SHEET_COLS].fillna("").values.tolist()
-            ws.append_rows(rows, value_input_option="USER_ENTERED")
-    except Exception: pass
+    if ws := bull_get_ws():
+        try: ws.clear(); ws.append_row(BULL_SHEET_COLS); ws.append_rows(df[BULL_SHEET_COLS].fillna("").values.tolist(), value_input_option="USER_ENTERED")
+        except Exception: pass
 
 # ==========================================
 # 🐂 BULL_v7 布林滾雪球策略（掃描器用）
 # ==========================================
-BULL_PARAMS = {
-    "boll_period"    : 15, "boll_std"       : 2.1,
-    "squeeze_n"      : 15, "squeeze_lookback": 5,
-    "vol_ma_days"    : 5,  "vol_ratio"      : 1.5,
-    "sma_trend_days" : 3,  "min_vol_shares" : 1_000_000,
-    "vol_ma20_days"  : 20, "vol_heavy_days" : 5,
-    "vol_shrink_days": 15, "init_position"  : 0.5,
-    "add_position"   : 0.5, "addon_b_profit" : 0.10,
-}
+BULL_PARAMS = {"boll_period": 15, "boll_std": 2.1, "squeeze_n": 15, "squeeze_lookback": 5, "vol_ma_days": 5, "vol_ratio": 1.5, "sma_trend_days": 3, "min_vol_shares": 1_000_000, "vol_ma20_days": 20, "vol_heavy_days": 5, "vol_shrink_days": 15, "init_position": 0.5, "add_position": 0.5, "addon_b_profit": 0.10}
 
 def bull_calc_indicators(df, params):
     df = df.copy()
     df.columns = [c.capitalize() for c in df.columns]
-    needed = [c for c in ['Open','High','Low','Close','Volume'] if c in df.columns]
-    df = df[needed].copy()
-    close  = df["Close"]; volume = df["Volume"]
-    bp     = params["boll_period"]
-    df["SMA"]        = close.rolling(bp).mean()
-    df["Std"]        = close.rolling(bp).std()
-    df["Upper"]      = df["SMA"] + df["Std"] * params["boll_std"]
-    df["Lower"]      = df["SMA"] - df["Std"] * params["boll_std"]
-    df["Bandwidth"]  = df["Upper"] - df["Lower"]
-    df["Vol_MA"]     = volume.rolling(params["vol_ma_days"]).mean()
-    sq_n = params["squeeze_n"]
-    df["BW_Min"]         = df["Bandwidth"].rolling(sq_n).min()
-    df["Is_Squeeze"]     = df["Bandwidth"] == df["BW_Min"]
-    lb = params["squeeze_lookback"]
-    df["Squeeze_Recent"] = df["Is_Squeeze"].shift(1).rolling(lb).max() == 1
-    df["SMA_Up"]     = df["SMA"] > df["SMA"].shift(params["sma_trend_days"])
-    df["Vol_MA20"]   = volume.rolling(params["vol_ma20_days"]).mean()
-    df["Vol_Heavy"]  = volume.rolling(params["vol_heavy_days"]).mean()
+    df = df[[c for c in ['Open','High','Low','Close','Volume'] if c in df.columns]].copy()
+    close  = df["Close"]; volume = df["Volume"]; bp = params["boll_period"]
+    df["SMA"] = close.rolling(bp).mean(); df["Std"] = close.rolling(bp).std()
+    df["Upper"] = df["SMA"] + df["Std"] * params["boll_std"]; df["Lower"] = df["SMA"] - df["Std"] * params["boll_std"]
+    df["Bandwidth"] = df["Upper"] - df["Lower"]; df["Vol_MA"] = volume.rolling(params["vol_ma_days"]).mean()
+    df["Is_Squeeze"] = df["Bandwidth"] == df["Bandwidth"].rolling(params["squeeze_n"]).min()
+    df["Squeeze_Recent"] = df["Is_Squeeze"].shift(1).rolling(params["squeeze_lookback"]).max() == 1
+    df["SMA_Up"] = df["SMA"] > df["SMA"].shift(params["sma_trend_days"])
+    df["Vol_MA20"] = volume.rolling(params["vol_ma20_days"]).mean()
+    df["Vol_Heavy"] = volume.rolling(params["vol_heavy_days"]).mean()
     df["Vol_Shrink"] = volume.rolling(params["vol_shrink_days"]).mean()
     return df
-
-def bull_check_entry(df, params):
-    if len(df) < params["boll_period"] + params["squeeze_n"]: return False
-    r = df.iloc[-1]
-    if pd.isna(r["Squeeze_Recent"]) or pd.isna(r["Vol_MA20"]): return False
-    squeeze  = bool(r["Squeeze_Recent"])
-    sma_up   = bool(r["SMA_Up"])
-    breakout = float(r["Close"]) > float(r["Upper"])
-    vol_ok   = float(r["Volume"]) > float(r["Vol_MA"]) * params["vol_ratio"]
-    min_vol  = float(r["Vol_MA20"]) > params["min_vol_shares"]
-    return squeeze and sma_up and breakout and vol_ok and min_vol
 
 def bull_scan_one(code, info, df_raw, params, pos_map, scan_date_ts):
     result = {"entry": None, "addon_a": None, "addon_b": None, "exit": None, "high_update": None}
@@ -360,71 +289,56 @@ def bull_scan_one(code, info, df_raw, params, pos_map, scan_date_ts):
         df = df[df.index <= scan_date_ts]
         if len(df) < 50: return result
 
-        sym = info["symbol"]; name = info["short_name"]
-        r = df.iloc[-1]; r1 = df.iloc[-2]
-        c = float(r["Close"]); sma_i = float(r["SMA"])
-        lo_i = float(r["Lower"]); l_i = float(r["Low"])
+        sym = info["symbol"]; name = info["short_name"]; r = df.iloc[-1]; r1 = df.iloc[-2]
+        c = float(r["Close"]); sma_i = float(r["SMA"]); lo_i = float(r["Lower"]); l_i = float(r["Low"])
         vol_i = float(r["Volume"]); vheavy = float(r["Vol_Heavy"]) if not pd.isna(r["Vol_Heavy"]) else 0
-        in_pos = sym in pos_map
 
-        if not in_pos:
-            if bull_check_entry(df, params):
-                result["entry"] = {
-                    "代號": code, "名稱": name, "symbol": sym, "收盤價": round(c, 2),
-                    "上軌": round(float(r["Upper"]), 2), "15MA": round(sma_i, 2),
-                    "成交量": int(vol_i), "5MA量": int(r["Vol_MA"]) if not pd.isna(r["Vol_MA"]) else 0,
-                }
+        if sym not in pos_map:
+            if not (pd.isna(r["Squeeze_Recent"]) or pd.isna(r["Vol_MA20"])):
+                if bool(r["Squeeze_Recent"]) and bool(r["SMA_Up"]) and (c > float(r["Upper"])) and (vol_i > float(r["Vol_MA"]) * params["vol_ratio"]) and (float(r["Vol_MA20"]) > params["min_vol_shares"]):
+                    result["entry"] = {"代號": code, "名稱": name, "symbol": sym, "收盤價": round(c, 2), "上軌": round(float(r["Upper"]), 2), "15MA": round(sma_i, 2), "成交量": int(vol_i), "5MA量": int(r["Vol_MA"]) if not pd.isna(r["Vol_MA"]) else 0}
         else:
-            pos = pos_map[sym]
-            entry_price = float(pos["進場價"]); last_addon_price = float(pos["上次加碼價"]); peak_price = float(pos["持倉最高價"])
-            if c > peak_price: result["high_update"] = (sym, round(c, 2))
+            pos = pos_map[sym]; ep = float(pos["進場價"]); lap = float(pos["上次加碼價"]); pp = float(pos["持倉最高價"])
+            if c > pp: result["high_update"] = (sym, round(c, 2))
 
             heavy_break = (c < sma_i) and (vol_i >= vheavy) and vheavy > 0
-            low_break   = l_i <= lo_i
-            if heavy_break or low_break:
-                result["exit"] = {
-                    "代號": code, "名稱": name, "symbol": sym, "收盤價": round(c, 2), "15MA": round(sma_i, 2),
-                    "進場價": round(entry_price, 2), "損益%": round((c - entry_price) / entry_price * 100, 2),
-                    "加碼次數": int(pos.get("加碼次數", 0)), "出場原因": "出量跌破15MA" if heavy_break else "最低碰下軌",
-                }
+            if heavy_break or (l_i <= lo_i):
+                result["exit"] = {"代號": code, "名稱": name, "symbol": sym, "收盤價": round(c, 2), "15MA": round(sma_i, 2), "進場價": round(ep, 2), "損益%": round((c - ep) / ep * 100, 2), "加碼次數": int(pos.get("加碼次數", 0)), "出場原因": "出量跌破15MA" if heavy_break else "最低碰下軌"}
                 return result
 
             vshrink = float(r1["Vol_Shrink"]) if not pd.isna(r1["Vol_Shrink"]) else 0
             if (float(r1["Close"]) < float(r1["SMA"])) and (float(r1["Volume"]) < vshrink if vshrink > 0 else False) and (c >= sma_i):
                 result["addon_a"] = {"代號": code, "名稱": name, "symbol": sym, "收盤價": round(c, 2), "15MA": round(sma_i, 2), "加碼次數": int(pos.get("加碼次數", 0)), "加碼類型": "A 回測站回"}
 
-            profit_from_last = (c - last_addon_price) / last_addon_price if last_addon_price > 0 else 0
-            if c > peak_price and profit_from_last >= params["addon_b_profit"]:
-                result["addon_b"] = {"代號": code, "名稱": name, "symbol": sym, "收盤價": round(c, 2), "持倉最高價": round(peak_price, 2), "距上次加碼": f"+{profit_from_last*100:.1f}%", "加碼次數": int(pos.get("加碼次數", 0)), "加碼類型": "B 突破新高"}
+            profit = (c - lap) / lap if lap > 0 else 0
+            if c > pp and profit >= params["addon_b_profit"]:
+                result["addon_b"] = {"代號": code, "名稱": name, "symbol": sym, "收盤價": round(c, 2), "持倉最高價": round(pp, 2), "距上次加碼": f"+{profit*100:.1f}%", "加碼次數": int(pos.get("加碼次數", 0)), "加碼類型": "B 突破新高"}
     except Exception: pass
     return result
 
 def bull_run_scan(stock_map, all_data, scan_date_str, bull_positions, bull_params, max_workers=16, status_text=None, progress_bar=None):
     scan_date_ts = pd.Timestamp(scan_date_str)
     pos_map = {row["symbol"]: row for _, row in bull_positions.iterrows()} if len(bull_positions) > 0 else {}
-    entry_list = []; addon_a_list = []; addon_b_list = []; exit_list = []; high_updates = []
-    valid_codes = {c: df for c, df in all_data.items() if c in stock_map}
+    res = {"entry": [], "addon_a": [], "addon_b": [], "exit": [], "high_updates": []}
+    valid_codes = {str(c): df for c, df in all_data.items() if str(c) in stock_map}
+    
     total = len(valid_codes); done = 0
-
     if status_text: status_text.text(f"🐂 BULL_v7 策略運算中... (共 {total} 支)")
     if progress_bar: progress_bar.progress(0)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(bull_scan_one, code, stock_map[code], df_raw, bull_params, pos_map, scan_date_ts): code for code, df_raw in valid_codes.items()}
+        futures = {executor.submit(bull_scan_one, code, stock_map[code], df, bull_params, pos_map, scan_date_ts): code for code, df in valid_codes.items()}
         for future in concurrent.futures.as_completed(futures):
             done += 1
             if done % 100 == 0 or done == total:
                 if progress_bar: progress_bar.progress(done / max(total, 1), text=f"🐂 BULL_v7 策略運算 {done}/{total}...")
-            res = future.result()
-            if res["entry"]: entry_list.append(res["entry"])
-            if res["addon_a"]: addon_a_list.append(res["addon_a"])
-            if res["addon_b"]: addon_b_list.append(res["addon_b"])
-            if res["exit"]: exit_list.append(res["exit"])
-            if res["high_update"]: high_updates.append(res["high_update"])
+            r = future.result()
+            for k in res.keys(): 
+                if r.get(k): res[k].append(r[k])
 
-    if status_text: status_text.success(f"✅ 全部掃描完成｜進場 {len(entry_list)} | 加碼A {len(addon_a_list)} | 加碼B {len(addon_b_list)} | 出場 {len(exit_list)}")
+    if status_text: status_text.success(f"✅ 全部掃描完成｜進場 {len(res['entry'])} | 加碼A {len(res['addon_a'])} | 加碼B {len(res['addon_b'])} | 出場 {len(res['exit'])}")
     if progress_bar: progress_bar.empty()
-    return {"entry": entry_list, "addon_a": addon_a_list, "addon_b": addon_b_list, "exit": exit_list, "high_updates": high_updates}
+    return res
 
 # ==========================================
 # 📂 歷史資料管理
@@ -432,8 +346,7 @@ def bull_run_scan(stock_map, all_data, scan_date_str, bull_positions, bull_param
 PARQUET_PATH = "data/history.parquet"
 
 def load_history_parquet():
-    if not os.path.exists(PARQUET_PATH):
-        return None, f"找不到 {PARQUET_PATH}，請確認 data/ 資料夾已上傳"
+    if not os.path.exists(PARQUET_PATH): return None, f"找不到 {PARQUET_PATH}，請確認 data/ 資料夾已上傳"
     try:
         df_all = pd.read_parquet(PARQUET_PATH)
         df_all["date"] = pd.to_datetime(df_all["date"])
@@ -442,43 +355,31 @@ def load_history_parquet():
             grp = grp.sort_values("date").set_index("date")
             grp = grp[["Open","High","Low","Close","Volume"]].copy()
             grp.index.name = None
-            data_store[code] = grp
+            data_store[str(code)] = grp # 🔧 修復1: 強制將 Parquet 讀出的 code 轉為字串，確保與 API 一致
         last_date = df_all["date"].max().strftime("%Y-%m-%d")
         return data_store, f"✅ 歷史資料載入完成：{len(data_store)} 支股票，最新日期 {last_date}"
-    except Exception as e:
-        return None, f"❌ 讀取 {PARQUET_PATH} 失敗：{e}"
+    except Exception as e: return None, f"❌ 讀取 {PARQUET_PATH} 失敗：{e}"
 
 def fetch_data_batch(stock_map, period="300d", chunk_size=150):
     all_symbols = [info['symbol'] for info in stock_map.values()]
-    data_store = {}
-    symbol_to_code = {v['symbol']: k for k, v in stock_map.items()}
+    data_store = {}; symbol_to_code = {v['symbol']: str(k) for k, v in stock_map.items()}
     total_chunks = (len(all_symbols) // chunk_size) + 1
-    progress_text = st.empty()
-    bar = st.progress(0)
+    progress_text = st.empty(); bar = st.progress(0)
 
     for i in range(0, len(all_symbols), chunk_size):
-        chunk = all_symbols[i:i + chunk_size]
-        if not chunk: continue
-        chunk_idx = (i // chunk_size) + 1
-        progress_text.text(f"📥 正在批量下載歷史資料... (批次 {chunk_idx}/{total_chunks})")
-        bar.progress(chunk_idx / total_chunks)
+        chunk = all_symbols[i:i + chunk_size]; chunk_idx = (i // chunk_size) + 1
+        progress_text.text(f"📥 正在批量下載歷史資料... (批次 {chunk_idx}/{total_chunks})"); bar.progress(chunk_idx / total_chunks)
         try:
-            tickers_str = " ".join(chunk)
-            batch_df = yf.download(tickers_str, period=period, group_by='ticker', threads=True, auto_adjust=True, progress=False)
+            batch_df = yf.download(" ".join(chunk), period=period, group_by='ticker', threads=True, auto_adjust=True, progress=False)
             if not batch_df.empty:
                 if isinstance(batch_df.columns, pd.MultiIndex):
                     for symbol in chunk:
-                        if symbol in batch_df:
-                            stock_df = batch_df[symbol].dropna()
-                            if not stock_df.empty:
-                                if stock_df.index.tz is not None: stock_df.index = stock_df.index.tz_localize(None)
-                                if symbol_to_code.get(symbol): data_store[symbol_to_code.get(symbol)] = stock_df
-                else:
-                    symbol = chunk[0]
-                    stock_df = batch_df.dropna()
-                    if not stock_df.empty:
-                        if stock_df.index.tz is not None: stock_df.index = stock_df.index.tz_localize(None)
-                        if symbol_to_code.get(symbol): data_store[symbol_to_code.get(symbol)] = stock_df
+                        if symbol in batch_df and not (stock_df := batch_df[symbol].dropna()).empty:
+                            if stock_df.index.tz is not None: stock_df.index = stock_df.index.tz_localize(None)
+                            if c := symbol_to_code.get(symbol): data_store[c] = stock_df
+                elif not (stock_df := batch_df.dropna()).empty:
+                    if stock_df.index.tz is not None: stock_df.index = stock_df.index.tz_localize(None)
+                    if c := symbol_to_code.get(chunk[0]): data_store[c] = stock_df
             time.sleep(1)
         except Exception: continue
     bar.empty()
@@ -488,57 +389,36 @@ def fetch_data_batch(stock_map, period="300d", chunk_size=150):
 # ⚡ 全時段即時報價 (100% 純 Shioaji API)
 # ==========================================
 def fetch_realtime_batch(codes_list, _api_instance, status_text=None):
-    """
-    不分盤中或盤後，一律使用永豐金 Shioaji API 獲取極速快照
-    """
+    """不分盤中或盤後，一律使用永豐金 Shioaji API 獲取極速快照"""
     realtime_data = {}
     _txt = status_text if status_text else st.sidebar.empty()
-
-    logger.info("全時段模式：使用永豐金 Shioaji API 獲取報價快照")
     rt_bar = st.sidebar.progress(0)
     
     try:
-        # 修正：使用字典查詢方式避免 `.get()` 問題
         contracts = []
         for c in codes_list:
-            try:
-                if c in _api_instance.Contracts.Stocks:
-                    contracts.append(_api_instance.Contracts.Stocks[c])
-            except: pass
+            c_str = str(c)
+            # 🔧 增強: 更安全的合約抓取方式
+            contract = _api_instance.Contracts.Stocks.get(c_str)
+            if contract: contracts.append(contract)
             
         total_c = len(contracts)
-        
         if total_c > 0:
             _txt.text(f"⚡ 永豐金快照擷取中 (共 {total_c} 支)...")
-            
-            chunk_size = 300
-            for i in range(0, total_c, chunk_size):
-                chunk = contracts[i:i + chunk_size]
-                snapshots = _api_instance.snapshots(chunk)
-                
-                for snap in snapshots:
-                    c = snap.code
+            for i in range(0, total_c, 300):
+                chunk = contracts[i:i + 300]
+                for snap in _api_instance.snapshots(chunk):
                     c_price = snap.close if snap.close > 0 else snap.previous_close
-                    
-                    realtime_data[c] = {
-                        "latest_trade_price": str(c_price),
-                        "open":   str(snap.open if snap.open > 0 else c_price),
-                        "high":   str(snap.high if snap.high > 0 else c_price),
-                        "low":    str(snap.low if snap.low > 0 else c_price),
+                    realtime_data[str(snap.code)] = {
+                        "latest_trade_price": str(c_price), "open": str(snap.open if snap.open > 0 else c_price),
+                        "high": str(snap.high if snap.high > 0 else c_price), "low": str(snap.low if snap.low > 0 else c_price),
                         "accumulate_trade_volume": str(int(snap.total_volume))
                     }
-                
-                pct = min(100, int((i + chunk_size) / total_c * 100))
-                rt_bar.progress(pct)
+                rt_bar.progress(min(100, int((i + 300) / total_c * 100)))
             
-        rt_bar.progress(100)
-        _txt.text(f"✅ 報價快照 (永豐金) 更新完成｜成功取得 {len(realtime_data)} 支")
-        
+        rt_bar.progress(100); _txt.text(f"✅ 報價快照 (永豐金) 更新完成｜成功取得 {len(realtime_data)} 支")
     except Exception as e:
-        logger.error(f"Shioaji 快照抓取錯誤: {e}")
-        _txt.text(f"❌ 永豐金連線異常: {e}")
-        rt_bar.progress(100)
-
+        logger.error(f"Shioaji 快照抓取錯誤: {e}"); _txt.text(f"❌ 永豐金連線異常: {e}"); rt_bar.progress(100)
     return realtime_data
 
 # ==========================================
@@ -547,82 +427,43 @@ def fetch_realtime_batch(codes_list, _api_instance, status_text=None):
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_market_status(analysis_date_str, _api_instance=None):
     try:
-        # 1. 先用 yfinance 獲取大盤歷史資料庫算 MA
-        tw = yf.Ticker("^TWII")
-        df = tw.history(period="1y")
+        df = yf.Ticker("^TWII").history(period="1y")
         if df.empty or df.index.tz is not None: df.index = df.index.tz_localize(None) if not df.empty else df.index
-        if df.empty: return {'strong': True, 'score': 5, 'label': '無法取得大盤資料'}
+        if df.empty: return {'strong': True, 'score': 5, 'label': '無法取得大盤資料', 'close': '-', 'ma20': '-', 'ma60': '-'}
         
         today_str = _now_tw().strftime('%Y-%m-%d')
+        df = df[~df.index.duplicated(keep='last')].copy() # 確保歷史庫索引乾淨
         
-        # 2. 如果是今天，使用永豐金 API 抓取加權指數 (TSE001) 即時快照，覆寫最新報價
-        realtime_close = None
         if _api_instance and analysis_date_str == today_str:
             try:
-                contract = _api_instance.Contracts.Indices.TSE.TSE001
-                snapshots = _api_instance.snapshots([contract])
-                if snapshots:
-                    snap = snapshots[0]
-                    realtime_close = snap.close if snap.close > 0 else snap.previous_close
-            except Exception as e:
-                logger.warning(f"Shioaji 大盤快照獲取失敗: {e}")
-        
-        # 若成功取得 Shioaji 最新指數，則將它塞入或更新到 df 中
-        if realtime_close is not None and realtime_close > 0:
-            if df.index[-1].strftime('%Y-%m-%d') == today_str:
-                df.iloc[-1, df.columns.get_loc('Close')] = realtime_close
-            else:
-                new_row = pd.Series({'Close': realtime_close}, name=pd.Timestamp(today_str))
-                df = pd.concat([df, new_row.to_frame().T])
+                if snap := _api_instance.snapshots([_api_instance.Contracts.Indices.TSE.TSE001]):
+                    rt_c = snap[0].close if snap[0].close > 0 else snap[0].previous_close
+                    today_ts = pd.Timestamp(today_str)
+                    if today_ts in df.index: df.loc[today_ts, 'Close'] = rt_c
+                    else: df = pd.concat([df, pd.Series({'Close': rt_c}, name=today_ts).to_frame().T])
+            except Exception: pass
 
-        df['DateStr'] = df.index.strftime('%Y-%m-%d')
-        latest_idx = df.index.get_loc(pd.Timestamp(analysis_date_str)) if analysis_date_str in df['DateStr'].values else -1
-        
-        close = df['Close'].ffill() # 防呆：避免出現 NaN
-        ma20 = close.rolling(20).mean()
-        ma60 = close.rolling(60).mean()
-        
+        latest_idx = df.index.get_loc(pd.Timestamp(analysis_date_str)) if pd.Timestamp(analysis_date_str) in df.index else -1
+        close = df['Close'].ffill(); ma20 = close.rolling(20).mean(); ma60 = close.rolling(60).mean()
         c = close.iloc[latest_idx]; m20 = ma20.iloc[latest_idx]; m60 = ma60.iloc[latest_idx]
         
-        score = 0
-        if c > m20:  score += 4
-        if c > m60:  score += 3
-        if m20 > m60: score += 3
-        
-        if score >= 7: label = "🟢 大盤強勢"
-        elif score >= 4: label = "🟡 大盤偏弱"
-        else: label = "🔴 大盤弱勢"
-        
-        return {'strong': score >= 7, 'score': score, 'label': label, 'close': round(c, 0), 'ma20': round(m20, 0), 'ma60': round(m60, 0)}
-    except Exception as e: 
-        logger.error(f"大盤狀態計算錯誤: {e}")
-        return {'strong': True, 'score': 5, 'label': '大盤資料異常'}
-
-def is_valid_stock_code(code):
-    return bool(code and code.isdigit() and len(code) == 4 and int(code) < 9000)
+        score = sum([4 if c > m20 else 0, 3 if c > m60 else 0, 3 if m20 > m60 else 0])
+        return {'strong': score >= 7, 'score': score, 'label': "🟢 大盤強勢" if score >= 7 else ("🟡 大盤偏弱" if score >= 4 else "🔴 大盤弱勢"), 'close': round(c, 0), 'ma20': round(m20, 0), 'ma60': round(m60, 0)}
+    except Exception: return {'strong': True, 'score': 5, 'label': '大盤資料異常', 'close': '-', 'ma20': '-', 'ma60': '-'}
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_disposal_stocks():
     disposal = {}
-    def roc_to_date(s):
-        parts = s.strip().replace('/', '-').split('-')
-        return datetime.date(int(parts[0].strip()) + 1911, int(parts[1].strip()), int(parts[2].strip()))
+    def roc_to_date(s): parts = s.strip().replace('/', '-').split('-'); return datetime.date(int(parts[0].strip()) + 1911, int(parts[1].strip()), int(parts[2].strip()))
     try:
-        today_dt = _now_tw().date()
-        url = f"https://www.twse.com.tw/rwd/zh/announcement/punish?response=json&startDate={(today_dt - datetime.timedelta(days=30)).strftime('%Y%m%d')}&endDate={(today_dt + datetime.timedelta(days=30)).strftime('%Y%m%d')}"
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15, verify=False)
-        if res.json().get('stat') == 'OK':
-            for row in res.json().get('data', []):
+        today_dt = _now_tw().date(); url = f"https://www.twse.com.tw/rwd/zh/announcement/punish?response=json&startDate={(today_dt - datetime.timedelta(days=30)).strftime('%Y%m%d')}&endDate={(today_dt + datetime.timedelta(days=30)).strftime('%Y%m%d')}"
+        if (res := requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15, verify=False)).json().get('stat') == 'OK':
+            for r in res.json().get('data', []):
                 try:
-                    code = str(row[2]).strip()
-                    if '～' in str(row[6]): parts = str(row[6]).split('～')
-                    elif '~' in str(row[6]): parts = str(row[6]).split('~')
-                    else: continue
-                    disposal_content = (str(row[7]) if len(row) > 7 else '') + (str(row[8]) if len(row) > 8 else '')
-                    if is_valid_stock_code(code) and ('每五分鐘' in disposal_content or '每5分鐘' in disposal_content):
-                        end_dt = roc_to_date(parts[1])
-                        if code not in disposal or end_dt > disposal[code]['end']:
-                            disposal[code] = {'name': str(row[3]).strip(), 'start': roc_to_date(parts[0]), 'end': end_dt, 'market': 'twse', 'symbol': f"{code}.TW", 'match_type': '5分鐘撮合'}
+                    c = str(r[2]).strip(); p = str(r[6]); d = (str(r[7]) if len(r)>7 else '') + (str(r[8]) if len(r)>8 else '')
+                    if c.isdigit() and len(c)==4 and int(c)<9000 and ('每五分鐘' in d or '每5分鐘' in d) and ('～' in p or '~' in p):
+                        end_dt = roc_to_date(p.split('～')[1] if '～' in p else p.split('~')[1])
+                        if c not in disposal or end_dt > disposal[c]['end']: disposal[c] = {'name': str(r[3]).strip(), 'start': roc_to_date(p.split('～')[0] if '～' in p else p.split('~')[0]), 'end': end_dt, 'market': 'twse', 'symbol': f"{c}.TW", 'match_type': '5分鐘撮合'}
                 except Exception: pass
     except Exception: pass
     
@@ -630,18 +471,12 @@ def fetch_disposal_stocks():
         try:
             res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15, verify=False)
             if res.text.strip().startswith('['):
-                for row in res.json():
+                for r in res.json():
                     try:
-                        code = str(row.get('SecuritiesCompanyCode', '')).strip()
-                        period = str(row.get('DispositionPeriod', '')).strip()
-                        if '~' in period:
-                            s, e = period.split('~')
-                            start_dt = datetime.date(int(s[0:3])+1911, int(s[3:5]), int(s[5:7]))
-                            end_dt = datetime.date(int(e[0:3])+1911, int(e[3:5]), int(e[5:7]))
-                        else: continue
-                        cond = str(row.get('DisposalCondition', ''))
-                        if is_valid_stock_code(code) and ('每5分鐘' in cond or '每五分鐘' in cond):
-                            disposal[code] = {'name': str(row.get('CompanyName', '')).strip(), 'start': start_dt, 'end': end_dt, 'market': 'tpex', 'symbol': f"{code}.TWO", 'match_type': '5分鐘撮合'}
+                        c = str(r.get('SecuritiesCompanyCode', '')).strip(); p = str(r.get('DispositionPeriod', '')).strip(); d = str(r.get('DisposalCondition', ''))
+                        if c.isdigit() and len(c)==4 and int(c)<9000 and ('每5分鐘' in d or '每五分鐘' in d) and '~' in p:
+                            s, e = p.split('~')
+                            disposal[c] = {'name': str(r.get('CompanyName', '')).strip(), 'start': datetime.date(int(s[0:3])+1911, int(s[3:5]), int(s[5:7])), 'end': datetime.date(int(e[0:3])+1911, int(e[3:5]), int(e[5:7])), 'market': 'tpex', 'symbol': f"{c}.TWO", 'match_type': '5分鐘撮合'}
                     except Exception: pass
         except Exception: pass
     return disposal
@@ -651,60 +486,33 @@ def analyze_disposal_stock(code, info, analysis_date, min_vol=0):
         df = yf.Ticker(info['symbol']).history(period="60d", auto_adjust=True)
         if df.empty or len(df) < 10: return None
         if df.index.tz is not None: df.index = df.index.tz_localize(None)
-        if min_vol > 0 and not df[(pd.Timestamp(info['start']) <= df.index) & (df.index <= pd.Timestamp(analysis_date))].empty:
-            if df[(pd.Timestamp(info['start']) <= df.index) & (df.index <= pd.Timestamp(analysis_date))]['Volume'].min() < min_vol * 1000: return None
-
-        df['ma5']  = df['Close'].rolling(5).mean()
-        df['ma10'] = df['Close'].rolling(10).mean()
+        if min_vol > 0 and not (dv := df[(pd.Timestamp(info['start']) <= df.index) & (df.index <= pd.Timestamp(analysis_date))]).empty and dv['Volume'].min() < min_vol * 1000: return None
+        df['ma5'] = df['Close'].rolling(5).mean(); df['ma10'] = df['Close'].rolling(10).mean()
         df_period = df[(df.index >= pd.Timestamp(info['start'])) & (df.index <= pd.Timestamp(analysis_date))].copy()
         if len(df_period) < 2: return None
 
         position = None; trades = []; latest_signal = None
         for i in range(1, len(df_period)):
-            today_str = df_period.index[i].strftime('%Y-%m-%d')
-            c_today = df_period['Close'].iloc[i]; prev_high = df_period['High'].iloc[i-1]
+            ts = df_period.index[i].strftime('%Y-%m-%d'); c = df_period['Close'].iloc[i]; ph = df_period['High'].iloc[i-1]
             if position is None:
-                if c_today > prev_high:
-                    position = {'entry_date': today_str, 'entry_price': c_today}
-                    latest_signal = {'status': '🟢 持有中', 'entry_date': today_str, 'entry_price': f"{c_today:.2f}", 'exit_date': '-', 'exit_price': '-', 'profit_pct': '-', 'exit_reason': '-', 'signal_date': today_str, 'signal_close': f"{c_today:.2f}", 'signal_prev_high': f"{prev_high:.2f}", 'signal_pct': f"{(c_today - df_period['Close'].iloc[i-1]) / df_period['Close'].iloc[i-1] * 100:+.2f}%"}
+                if c > ph:
+                    position = {'entry_date': ts, 'entry_price': c}
+                    latest_signal = {'status': '🟢 持有中', 'entry_date': ts, 'entry_price': f"{c:.2f}", 'exit_date': '-', 'exit_price': '-', 'profit_pct': '-', 'exit_reason': '-', 'signal_date': ts, 'signal_close': f"{c:.2f}", 'signal_prev_high': f"{ph:.2f}", 'signal_pct': f"{(c - df_period['Close'].iloc[i-1]) / df_period['Close'].iloc[i-1] * 100:+.2f}%"}
             else:
-                profit_pct = (c_today - position['entry_price']) / position['entry_price'] * 100
-                exit_ma = df_period['ma5'].iloc[i] if profit_pct >= 15.0 else df_period['ma10'].iloc[i]
-                if pd.notna(exit_ma) and c_today < exit_ma:
-                    trades.append({'entry_date': position['entry_date'], 'entry_price': position['entry_price'], 'exit_date': today_str, 'exit_price': c_today, 'profit_pct': profit_pct, 'exit_reason': f"跌破{'5MA' if profit_pct >= 15 else '10MA'}"})
-                    position = None; latest_signal = None
-                else:
-                    latest_signal = {'status': '🟢 持有中', 'entry_date': position['entry_date'], 'entry_price': f"{position['entry_price']:.2f}", 'exit_date': '-', 'exit_price': '-', 'profit_pct': f"{profit_pct:+.2f}%", 'exit_reason': f"出場條件：跌破{'5MA' if profit_pct >= 15 else '10MA'}", 'signal_date': position['entry_date'], 'signal_close': f"{position['entry_price']:.2f}", 'signal_prev_high': '-', 'signal_pct': '-'}
-
-        if latest_signal is None and not trades: return None
-        last_trade = trades[-1] if trades else None
-        status = latest_signal['status'] if latest_signal else ('⚫ 已出場' if last_trade else '-')
-
-        return {
-            'code': code, 'name': info['name'], 'market': '上市' if info['market'] == 'twse' else '上櫃',
-            'disposal_start': info['start'].strftime('%Y-%m-%d'), 'disposal_end': info['end'].strftime('%Y-%m-%d'),
-            'days_left': max((info['end'] - analysis_date).days, 0), 'status': status,
-            'is_new_today': bool(latest_signal and latest_signal.get('entry_date') == analysis_date.strftime('%Y-%m-%d') and status == '🟢 持有中'),
-            'entry_date': latest_signal['entry_date'] if latest_signal else (last_trade['entry_date'] if last_trade else '-'),
-            'entry_price': latest_signal['entry_price'] if latest_signal else (f"{last_trade['entry_price']:.2f}" if last_trade else '-'),
-            'exit_date': latest_signal.get('exit_date', '-') if latest_signal else (last_trade['exit_date'] if last_trade else '-'),
-            'exit_price': latest_signal.get('exit_price', '-') if latest_signal else (f"{last_trade['exit_price']:.2f}" if last_trade else '-'),
-            'profit_pct': latest_signal.get('profit_pct', '-') if latest_signal else (f"{last_trade['profit_pct']:+.2f}%" if last_trade else '-'),
-            'exit_reason': latest_signal.get('exit_reason', '-') if latest_signal else (last_trade['exit_reason'] if last_trade else '-'),
-            'signal_date': latest_signal.get('signal_date', '-') if latest_signal else '-',
-            'signal_close': latest_signal.get('signal_close', '-') if latest_signal else '-',
-            'signal_prev_high': latest_signal.get('signal_prev_high', '-') if latest_signal else '-',
-            'signal_pct': latest_signal.get('signal_pct', '-') if latest_signal else '-',
-            'total_trades': len(trades),
-        }
+                pct = (c - position['entry_price']) / position['entry_price'] * 100
+                if pd.notna(exit_ma := df_period['ma5'].iloc[i] if pct >= 15.0 else df_period['ma10'].iloc[i]) and c < exit_ma:
+                    trades.append({'entry_date': position['entry_date'], 'entry_price': position['entry_price'], 'exit_date': ts, 'exit_price': c, 'profit_pct': pct, 'exit_reason': f"跌破{'5MA' if pct >= 15 else '10MA'}"}); position = None; latest_signal = None
+                else: latest_signal = {'status': '🟢 持有中', 'entry_date': position['entry_date'], 'entry_price': f"{position['entry_price']:.2f}", 'exit_date': '-', 'exit_price': '-', 'profit_pct': f"{pct:+.2f}%", 'exit_reason': f"出場條件：跌破{'5MA' if pct >= 15 else '10MA'}", 'signal_date': position['entry_date'], 'signal_close': f"{position['entry_price']:.2f}", 'signal_prev_high': '-', 'signal_pct': '-'}
+        
+        if not latest_signal and not trades: return None
+        return {'code': code, 'name': info['name'], 'market': '上市' if info['market'] == 'twse' else '上櫃', 'disposal_start': info['start'].strftime('%Y-%m-%d'), 'disposal_end': info['end'].strftime('%Y-%m-%d'), 'days_left': max((info['end'] - analysis_date).days, 0), 'status': latest_signal['status'] if latest_signal else '⚫ 已出場', 'is_new_today': bool(latest_signal and latest_signal.get('entry_date') == analysis_date.strftime('%Y-%m-%d') and latest_signal['status'] == '🟢 持有中'), 'entry_date': latest_signal['entry_date'] if latest_signal else trades[-1]['entry_date'], 'entry_price': latest_signal['entry_price'] if latest_signal else f"{trades[-1]['entry_price']:.2f}", 'exit_date': latest_signal.get('exit_date', '-') if latest_signal else trades[-1]['exit_date'], 'exit_price': latest_signal.get('exit_price', '-') if latest_signal else f"{trades[-1]['exit_price']:.2f}", 'profit_pct': latest_signal.get('profit_pct', '-') if latest_signal else f"{trades[-1]['profit_pct']:+.2f}%", 'exit_reason': latest_signal.get('exit_reason', '-') if latest_signal else trades[-1]['exit_reason'], 'signal_date': latest_signal.get('signal_date', '-') if latest_signal else '-', 'signal_close': latest_signal.get('signal_close', '-') if latest_signal else '-', 'signal_prev_high': latest_signal.get('signal_prev_high', '-') if latest_signal else '-', 'signal_pct': latest_signal.get('signal_pct', '-') if latest_signal else '-', 'total_trades': len(trades)}
     except Exception: return None
 
 def show_disposal_table(data):
     if not data: return
     df = pd.DataFrame(data)
     col_map = {'code': '代號', 'name': '名稱', 'market': '市場', 'disposal_start': '處置開始', 'disposal_end': '處置結束', 'days_left': '剩餘天數', 'status': '狀態', 'entry_date': '進場日', 'entry_price': '進場價', 'exit_date': '出場日', 'exit_price': '出場價', 'profit_pct': '損益', 'exit_reason': '出場條件', 'signal_date': '訊號日', 'signal_close': '訊號收盤', 'signal_prev_high': '前日高點', 'signal_pct': '訊號漲幅'}
-    show_cols = [c for c in col_map if c in df.columns]
-    st.dataframe(df[show_cols].rename(columns=col_map), width='stretch', hide_index=True)
+    st.dataframe(df[[c for c in col_map if c in df.columns]].rename(columns=col_map), width='stretch', hide_index=True)
 
 # ==========================================
 # 🏆 綜合分析引擎與評分
@@ -742,45 +550,33 @@ def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sect
     try:
         df = pre_loaded_df.copy() if pre_loaded_df is not None else get_stock_data_with_realtime(code, info['symbol'], analysis_date_str, api)
         if df is None or df.empty or len(df) < 200: return "資料長度不足 (<200天)"
-        df['DateStr'] = df.index.strftime('%Y-%m-%d')
-        if analysis_date_str not in df['DateStr'].values: return f"無 {analysis_date_str} 交易資料"
         
+        # 🔧 修復2: 徹底防堵 Pandas Index 重複報錯
+        df = df.loc[~df.index.duplicated(keep='last')].copy()
+        
+        if pd.Timestamp(analysis_date_str) not in df.index: return f"無 {analysis_date_str} 交易資料"
         idx = df.index.get_loc(pd.Timestamp(analysis_date_str))
+        
         close = df['Close']; high = df['High']; low = df['Low']; volume = df['Volume']; op = df['Open']
-        stock_name = info['short_name']
-        sector_name = get_detailed_sector(code, standard_group=info.get('group'), custom_db=custom_sector_db)
-
+        stock_name = info['short_name']; sector_name = get_detailed_sector(code, standard_group=info.get('group'), custom_db=custom_sector_db)
         result_sniper = None; result_day = None
+
         s_ma_trend = params['s_ma_trend']; s_use_year = params['s_use_year']; s_big_candle = params['s_big_candle']; s_min_vol = params['s_min_vol']
-        s_setup_lookback = params.get('s_setup_lookback', 25); s_vol_ma_days = params.get('s_vol_ma_days', 20); s_vol_ratio = params.get('s_vol_ratio', 0.7); s_pullback_max = params.get('s_pullback_max', 50)
-
         ma_t = close.rolling(window=s_ma_trend).mean(); ma_y = close.rolling(window=240).mean(); ma10 = close.rolling(window=10).mean(); ma20 = close.rolling(window=20).mean(); ma60 = close.rolling(window=60).mean()
-        vol_ma_setup = volume.rolling(window=s_vol_ma_days).mean()
+        vol_ma_setup = volume.rolling(window=params.get('s_vol_ma_days', 20)).mean()
 
-        is_sniper_candidate = True
-        if volume.iloc[idx] < s_min_vol: is_sniper_candidate = False
-        if s_use_year and len(ma_y) > idx and (pd.isna(ma_y.iloc[idx]) or close.iloc[idx] < ma_y.iloc[idx]): is_sniper_candidate = False
-        if not (close.iloc[idx] > ma_t.iloc[idx] and ma_t.iloc[idx] > ma_t.iloc[idx-1]): is_sniper_candidate = False
-        if not (pd.notna(ma10.iloc[idx]) and pd.notna(ma20.iloc[idx]) and pd.notna(ma60.iloc[idx]) and close.iloc[idx] > ma10.iloc[idx] > ma20.iloc[idx] > ma60.iloc[idx]): is_sniper_candidate = False
-
-        if is_sniper_candidate:
-            is_setup = ((close.iloc[idx] - close.iloc[idx-1]) / close.iloc[idx-1] > s_big_candle and volume.iloc[idx] > vol_ma_setup.iloc[idx] * s_vol_ratio and close.iloc[idx] > op.iloc[idx])
+        if (volume.iloc[idx] >= s_min_vol) and (not s_use_year or not (pd.isna(ma_y.iloc[idx]) or close.iloc[idx] < ma_y.iloc[idx])) and (close.iloc[idx] > ma_t.iloc[idx] > ma_t.iloc[idx-1]) and (pd.notna(ma60.iloc[idx]) and close.iloc[idx] > ma10.iloc[idx] > ma20.iloc[idx] > ma60.iloc[idx]):
+            is_setup = ((close.iloc[idx] - close.iloc[idx-1]) / close.iloc[idx-1] > s_big_candle and volume.iloc[idx] > vol_ma_setup.iloc[idx] * params.get('s_vol_ratio', 0.7) and close.iloc[idx] > op.iloc[idx])
             setup_found = False; s_high = 0; s_low = 0; s_close = 0; s_date = ""; setup_idx = -1; defense_price = 0
 
-            for k in range(1, s_setup_lookback + 1):
-                b_idx = idx - k
-                if b_idx < 1: break
-                if ((close.iloc[b_idx] - close.iloc[b_idx-1]) / close.iloc[b_idx-1] > s_big_candle and volume.iloc[b_idx] > vol_ma_setup.iloc[b_idx] * s_vol_ratio and close.iloc[b_idx] > op.iloc[b_idx]):
-                    setup_found = True; setup_idx = b_idx
-                    s_low = low.iloc[b_idx]; s_high = high.iloc[b_idx]; s_close = close.iloc[b_idx]; s_date = df.index[b_idx].strftime('%Y-%m-%d')
-                    prev_high_setup = high.iloc[b_idx-1]; prev_close_setup = close.iloc[b_idx-1]; prev_open_setup = op.iloc[b_idx-1]
-                    if s_low > prev_high_setup: base_val = prev_close_setup if prev_close_setup >= prev_open_setup else prev_open_setup
-                    else: base_val = s_low
-                    defense_price = base_val * 0.99
+            for k in range(1, params.get('s_setup_lookback', 25) + 1):
+                if (b_idx := idx - k) < 1: break
+                if ((close.iloc[b_idx] - close.iloc[b_idx-1]) / close.iloc[b_idx-1] > s_big_candle and volume.iloc[b_idx] > vol_ma_setup.iloc[b_idx] * params.get('s_vol_ratio', 0.7) and close.iloc[b_idx] > op.iloc[b_idx]):
+                    setup_found = True; setup_idx = b_idx; s_low = low.iloc[b_idx]; s_high = high.iloc[b_idx]; s_close = close.iloc[b_idx]; s_date = df.index[b_idx].strftime('%Y-%m-%d')
+                    defense_price = (close.iloc[b_idx-1] if close.iloc[b_idx-1] >= op.iloc[b_idx-1] else op.iloc[b_idx-1]) * 0.99 if s_low > high.iloc[b_idx-1] else s_low * 0.99
                     break
 
-            c_today = close.iloc[idx]; prev_close_today = close.iloc[idx-1]; prev_h = high.iloc[idx-1]
-            daily_pct = (c_today - prev_close_today) / prev_close_today * 100
+            c_today = close.iloc[idx]; prev_h = high.iloc[idx-1]; daily_pct = (c_today - close.iloc[idx-1]) / close.iloc[idx-1] * 100
 
             if setup_found:
                 is_broken = False; dropped_below_high = False
@@ -788,39 +584,24 @@ def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sect
                     if close.iloc[k] < defense_price: is_broken = True; break
                     if close.iloc[k] < s_high: dropped_below_high = True
 
-                consolidation_close_min = close.iloc[setup_idx + 1 : idx].min() if setup_idx + 1 < idx else s_close
-                pullback_depth = (s_close - consolidation_close_min) / s_close * 100
-                is_pullback_ok = pullback_depth <= s_pullback_max
-
-                if not is_broken and is_pullback_ok:
-                    is_breakout = c_today > prev_h
-                    is_gap_breakout = (op.iloc[idx] > high.iloc[idx-1]) and (close.iloc[idx] > op.iloc[idx])
-
+                if not is_broken and (pullback_depth := (s_close - (close.iloc[setup_idx + 1 : idx].min() if setup_idx + 1 < idx else s_close)) / s_close * 100) <= params.get('s_pullback_max', 50):
+                    is_breakout = c_today > prev_h; is_gap_breakout = (op.iloc[idx] > high.iloc[idx-1]) and (close.iloc[idx] > op.iloc[idx])
                     if not dropped_below_high:
                         if (c_today - s_close) / s_close <= 0.10:
-                            if is_breakout:
-                                score, score_details = calc_sniper_score(c_today, prev_h, defense_price, s_high, s_low, s_close, setup_idx, idx, high, low, volume, op, market_score, pullback_depth)
-                                result_sniper = ("triggered", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "漲幅": f"{daily_pct:+.2f}%", "產業": sector_name, "狀態": "🚀 強勢突破", "訊號日": s_date, "突破價": f"{prev_h:.2f}", "防守價": f"{defense_price:.2f}", "風險距離": f"{'✅' if score_details.get('風險距離',0)<=5.0 else '⚠️'}{score_details.get('風險距離',0):.1f}%", "回測深度": f"{'🔒' if score_details.get('回測深度',0)<=38 else '📊'}{score_details.get('回測深度',0):.1f}%", "sort_pct": daily_pct, "_score": score, "_risk_pct": score_details.get('風險距離',0), "_setup_date": s_date, "_defense": defense_price, "_signal_high": s_high, "_signal_low": s_low})
-                            else:
-                                result_sniper = ("watching", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "漲幅": f"{daily_pct:+.2f}%", "產業": sector_name, "狀態": "💪 強勢整理", "訊號日": s_date, "防守": f"{defense_price:.2f}", "長紅高": f"{s_high:.2f}", "sort_pct": daily_pct, "_setup_date": s_date, "_defense": defense_price, "_signal_high": s_high, "_signal_low": s_low})
+                            score, score_details = calc_sniper_score(c_today, prev_h, defense_price, s_high, s_low, s_close, setup_idx, idx, high, low, volume, op, market_score, pullback_depth)
+                            result_sniper = ("triggered", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "漲幅": f"{daily_pct:+.2f}%", "產業": sector_name, "狀態": "🚀 強勢突破", "訊號日": s_date, "突破價": f"{prev_h:.2f}", "防守價": f"{defense_price:.2f}", "風險距離": f"{'✅' if score_details.get('風險距離',0)<=5.0 else '⚠️'}{score_details.get('風險距離',0):.1f}%", "回測深度": f"{'🔒' if score_details.get('回測深度',0)<=38 else '📊'}{score_details.get('回測深度',0):.1f}%", "sort_pct": daily_pct, "_score": score, "_risk_pct": score_details.get('風險距離',0), "_setup_date": s_date, "_defense": defense_price, "_signal_high": s_high, "_signal_low": s_low}) if is_breakout else ("watching", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "漲幅": f"{daily_pct:+.2f}%", "產業": sector_name, "狀態": "💪 強勢整理", "訊號日": s_date, "防守": f"{defense_price:.2f}", "長紅高": f"{s_high:.2f}", "sort_pct": daily_pct, "_setup_date": s_date, "_defense": defense_price, "_signal_high": s_high, "_signal_low": s_low})
                     else:
                         if (is_breakout and close.iloc[idx-1] <= (s_high * 1.02)) or is_gap_breakout:
                             score, score_details = calc_sniper_score(c_today, prev_h, defense_price, s_high, s_low, s_close, setup_idx, idx, high, low, volume, op, market_score, pullback_depth)
                             result_sniper = ("triggered", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "漲幅": f"{daily_pct:+.2f}%", "產業": sector_name, "狀態": "🚀 N字跳空" if is_gap_breakout else "🎯 N字突破", "訊號日": s_date, "突破價": f"{prev_h:.2f}", "防守價": f"{defense_price:.2f}", "風險距離": f"{'✅' if score_details.get('風險距離',0)<=5.0 else '⚠️'}{score_details.get('風險距離',0):.1f}%", "回測深度": f"{'🔒' if score_details.get('回測深度',0)<=38 else '📊'}{score_details.get('回測深度',0):.1f}%", "sort_pct": daily_pct, "_score": score, "_risk_pct": score_details.get('風險距離',0), "_setup_date": s_date, "_defense": defense_price, "_signal_high": s_high, "_signal_low": s_low})
-                        else:
-                            result_sniper = ("watching", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "漲幅": f"{daily_pct:+.2f}%", "產業": sector_name, "狀態": "📉 回檔整理", "訊號日": s_date, "防守": f"{defense_price:.2f}", "長紅高": f"{s_high:.2f}", "sort_pct": daily_pct, "_setup_date": s_date, "_defense": defense_price, "_signal_high": s_high, "_signal_low": s_low})
+                        else: result_sniper = ("watching", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "漲幅": f"{daily_pct:+.2f}%", "產業": sector_name, "狀態": "📉 回檔整理", "訊號日": s_date, "防守": f"{defense_price:.2f}", "長紅高": f"{s_high:.2f}", "sort_pct": daily_pct, "_setup_date": s_date, "_defense": defense_price, "_signal_high": s_high, "_signal_low": s_low})
             elif is_setup:
-                pct_chg = (c_today - close.iloc[idx-1]) / close.iloc[idx-1] * 100
-                result_sniper = ("new_setup", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "產業": sector_name, "狀態": "🔥 剛起漲", "漲幅": f"{pct_chg:+.2f}%", "sort_pct": pct_chg, "_setup_date": df.index[idx].strftime('%Y-%m-%d'), "_defense": defense_price, "_signal_high": high.iloc[idx], "_signal_low": low.iloc[idx]})
+                result_sniper = ("new_setup", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "產業": sector_name, "狀態": "🔥 剛起漲", "漲幅": f"{daily_pct:+.2f}%", "sort_pct": daily_pct, "_setup_date": df.index[idx].strftime('%Y-%m-%d'), "_defense": defense_price, "_signal_high": high.iloc[idx], "_signal_low": low.iloc[idx]})
 
         d_period = params['d_period']; d_threshold = params['d_threshold']; d_min_vol = params['d_min_vol']; d_min_pct = params['d_min_pct']
         d_close = close.iloc[idx]; d_open = op.iloc[idx]; d_high = high.iloc[idx]; d_volume = volume.iloc[idx]; d_prev_close = close.iloc[idx-1]
-
-        pct_chg_val = (d_close - d_prev_close) / d_prev_close
-        if idx >= d_period:
-            prev_period_high = high.iloc[idx-d_period : idx].max()
-            if (d_close > d_open) and ((d_high - d_close) / d_close < 0.01) and (d_min_pct/100 < pct_chg_val < 0.095) and ((d_volume / 1000) > d_min_vol) and (d_close >= (prev_period_high * (1 - (d_threshold / 100)))) and (d_high <= prev_period_high):
-                result_day = {"代號": code, "名稱": stock_name, "收盤": f"{d_close:.2f}", "產業": sector_name, "漲幅": f"{(pct_chg_val*100):.2f}%", "成交量": int(d_volume/1000), "前波高點": f"{prev_period_high:.2f}", "距離高點": f"{(d_close - prev_period_high) / prev_period_high * 100:+.2f}%", "狀態": "⚡ 蓄勢待發"}
+        if idx >= d_period and (d_close > d_open) and ((d_high - d_close) / d_close < 0.01) and (d_min_pct/100 < (pct_chg_val := (d_close - d_prev_close) / d_prev_close) < 0.095) and ((d_volume / 1000) > d_min_vol) and (d_close >= ((prev_period_high := high.iloc[idx-d_period : idx].max()) * (1 - (d_threshold / 100)))) and (d_high <= prev_period_high):
+            result_day = {"代號": code, "名稱": stock_name, "收盤": f"{d_close:.2f}", "產業": sector_name, "漲幅": f"{(pct_chg_val*100):.2f}%", "成交量": int(d_volume/1000), "前波高點": f"{prev_period_high:.2f}", "距離高點": f"{(d_close - prev_period_high) / prev_period_high * 100:+.2f}%", "狀態": "⚡ 蓄勢待發"}
 
         return {'sniper': result_sniper, 'day': result_day}
     except Exception as e: return f"程式執行錯誤: {str(e)}"
@@ -839,8 +620,7 @@ def run_diagnosis(stock_input, analysis_date_str, params):
     return df, f"{stock_input}.TW"
 
 def plot_diagnosis_chart(df, stock_input, analysis_date_str, params, sniper_info=None):
-    df = df.copy()
-    df['MA_Trend'] = df['Close'].rolling(window=params['s_ma_trend']).mean()
+    df = df.copy(); df['MA_Trend'] = df['Close'].rolling(window=params['s_ma_trend']).mean()
     df['MA20'] = df['Close'].rolling(window=20).mean(); df['MA240'] = df['Close'].rolling(window=240).mean()
     plot_df = df.tail(250)
 
@@ -896,7 +676,6 @@ else: st.sidebar.warning("⚠️ 未找到 data/history.parquet，將使用 yfin
 
 st.sidebar.success("🟢 Shioaji 全時段連線中")
 
-# 側邊欄日期修正：確保無論主機在哪裡，預設都是台灣時間的「今天」
 analysis_date_input = st.sidebar.date_input("分析基準日", _now_tw().date())
 analysis_date_str = analysis_date_input.strftime('%Y-%m-%d')
 
@@ -917,7 +696,7 @@ with st.sidebar.expander("🟢 狙擊手策略參數 (波段)", expanded=False):
     s_pullback_max = st.slider("整理回測深度上限 (%)", 20, 70, 50, 5)
 
 with st.sidebar.expander("🎯 處置股策略參數", expanded=False):
-    d_show_all = st.checkbox("顯示全部（含無訊號）", value=True)
+    d_show_all = st.checkbox("顯示全部（含無訊號）", value=True) # 🔧 已預設為 True
     d_vol_filter = st.checkbox("啟用底量濾網", value=False)
     d_min_vol_disp = st.number_input("底量門檻（張）", min_value=0, max_value=10000, value=1000, step=100, disabled=not d_vol_filter)
 
@@ -969,7 +748,7 @@ def params_changed():
 if start_scan:
     stock_map = get_stock_info_map(api)
     status_text.text("📈 正在判斷大盤狀態...")
-    market_status = fetch_market_status(analysis_date_str, api) # 傳入 api 實例以抓取大盤快照
+    market_status = fetch_market_status(analysis_date_str, api)
     st.session_state['market_status'] = market_status
 
     sniper_triggered = []; sniper_setup = []; sniper_watching = []; day_candidates = []; failed_list = []
@@ -982,7 +761,8 @@ if start_scan:
         history_data_store = fetch_data_batch(stock_map)
     else:
         status_text.text(load_msg)
-        history_data_store = {k: v for k, v in history_data_store.items() if k in stock_map}
+        # 🔧 防護：確保 history_data_store 的 Key 與 stock_map 的 Key 同為字串，避免被過濾空！
+        history_data_store = {str(k): v for k, v in history_data_store.items() if str(k) in stock_map}
 
     st.session_state['all_data_cache']   = history_data_store
     st.session_state['stock_map_cache']  = stock_map
@@ -990,7 +770,6 @@ if start_scan:
     today_str = _now_tw().strftime('%Y-%m-%d')
     realtime_map = {}
     
-    # ── 終極版修改：不管是盤中還是盤後，一律跟 Shioaji 討快照 ──
     if analysis_date_str == today_str:
         status_text.text("⚡ 正在請求永豐金 Shioaji 報價快照...")
         realtime_map = fetch_realtime_batch(list(history_data_store.keys()), api, status_text=status_text)
@@ -999,18 +778,18 @@ if start_scan:
     progress_bar.progress(0)
 
     tasks_data = {}
-    
-    # 防呆轉換浮點數
     def safe_f(val, default=0.0):
-        try:
-            if val in ('-', '', None): return default
-            return float(str(val).replace(',', ''))
+        try: return float(str(val).replace(',', '')) if val not in ('-', '', None) else default
         except: return default
 
     for code, df in history_data_store.items():
-        if code in realtime_map and realtime_map[code].get('latest_trade_price', '-') != '-':
+        code_str = str(code)
+        # 🔧 防護：清除歷史庫中殘留的「今天」，避免 Index 重複造成 Pandas 報錯
+        df = df.loc[~df.index.duplicated(keep='first')].copy()
+        
+        if code_str in realtime_map and realtime_map[code_str].get('latest_trade_price', '-') != '-':
             try:
-                rt = realtime_map[code]
+                rt = realtime_map[code_str]
                 c_p = safe_f(rt.get('latest_trade_price'))
                 o_p = safe_f(rt.get('open')) or c_p
                 h_p = safe_f(rt.get('high')) or c_p
@@ -1018,11 +797,16 @@ if start_scan:
                 v_p = safe_f(rt.get('accumulate_trade_volume')) * 1000
                 
                 if c_p > 0:
-                    new_row = pd.Series({'Open': o_p, 'High': h_p, 'Low': l_p, 'Close': c_p, 'Volume': v_p}, name=pd.Timestamp(today_str))
-                    if df.index[-1].strftime('%Y-%m-%d') == today_str: df.iloc[-1] = new_row
-                    else: df = pd.concat([df, new_row.to_frame().T])
-            except Exception as e: logger.warning(f"更新即時資料失敗 {code}: {e}")
-        tasks_data[code] = df
+                    today_ts = pd.Timestamp(today_str)
+                    new_row = pd.Series({'Open': o_p, 'High': h_p, 'Low': l_p, 'Close': c_p, 'Volume': v_p}, name=today_ts)
+                    
+                    # 🔧 防護：使用 loc 精準更新或寫入今天的資料列
+                    if today_ts in df.index:
+                        df.loc[today_ts] = new_row
+                    else:
+                        df = pd.concat([df, new_row.to_frame().T])
+            except Exception as e: logger.warning(f"更新即時資料失敗 {code_str}: {e}")
+        tasks_data[code_str] = df
 
     st.session_state['all_data_cache'] = tasks_data
     total = len(tasks_data); done = 0
@@ -1094,7 +878,7 @@ with tab1:
         mc1, mc2, mc3, mc4 = st.columns(4)
         mc1.metric("大盤狀態", mkt['label'])
         
-        # 🔧 修正：防止大盤抓不到資料時 ValueError 崩潰
+        # 🔧 防護：確保當 API 獲取失敗時 (顯示 '-' )，排版不會崩潰
         c_val = mkt.get('close', '-')
         m20_val = mkt.get('ma20', '-')
         m60_val = mkt.get('ma60', '-')
