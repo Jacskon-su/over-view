@@ -103,7 +103,7 @@ def get_shioaji_api():
         st.error("❌ 找不到永豐金 API 金鑰！請在 `.streamlit/secrets.toml` 中設定 `[shioaji]` 的 `api_key` 與 `secret_key`。")
         st.stop()
         
-    api = sj.Shioaji(simulation=False)
+    api = sj.Shioaji(simulation=True)
     try:
         api.login(
             api_key=st.secrets["shioaji"]["api_key"],
