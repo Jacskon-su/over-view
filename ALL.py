@@ -103,7 +103,7 @@ def get_shioaji_api():
         st.error("❌ 找不到永豐金 API 金鑰！請在 `.streamlit/secrets.toml` 中設定 `[shioaji]` 的 `api_key` 與 `secret_key`。")
         st.stop()
         
-    api = sj.Shioaji(simulation=True)
+    api = sj.Shioaji(simulation=False)
     try:
         api.login(
             api_key=st.secrets["shioaji"]["api_key"],
@@ -398,9 +398,8 @@ def fetch_realtime_batch(codes_list, _api_instance, status_text=None):
         contracts = []
         for c in codes_list:
             c_str = str(c)
-            # TSE（上市）優先，找不到再查 OTC（上櫃）
-            contract = (_api_instance.Contracts.Stocks.TSE.get(c_str)
-                        or _api_instance.Contracts.Stocks.OTC.get(c_str))
+            # 🔧 增強: 更安全的合約抓取方式
+            contract = _api_instance.Contracts.Stocks.get(c_str)
             if contract: contracts.append(contract)
             
         total_c = len(contracts)
