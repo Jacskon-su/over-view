@@ -29,13 +29,13 @@ jobs:
       # 3. 安裝套件
       - name: 📦 Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install requests lxml beautifulsoup4
-          pip install twstock
-          pip install yfinance pandas pyarrow
+          pip install yfinance pandas pyarrow shioaji
 
       # 4. 執行更新腳本
       - name: 🔄 Run update_data.py
+        env:
+          SJ_API_KEY: ${{ secrets.SJ_API_KEY }}
+          SJ_SECRET_KEY: ${{ secrets.SJ_SECRET_KEY }}
         run: python update_data.py
 
       # 5. 若有資料變動，自動 commit + push 回 Repo
