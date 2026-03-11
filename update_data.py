@@ -11,12 +11,6 @@ import os
 import time
 from datetime import datetime, timedelta
 
-try:
-    import twstock
-except ImportError:
-    print("❌ 請先安裝 twstock：pip install twstock")
-    exit(1)
-
 # ==========================================
 # 設定
 # ==========================================
@@ -31,13 +25,63 @@ SLEEP_SEC   = 2
 # 取得全台股清單
 # ==========================================
 def get_stock_map():
+    """
+    從永豐金 Shioaji 合約取得股票清單（含新上市/上櫃）
+    需要在環境變數或 .env 設定 SJ_API_KEY / SJ_SECRET_KEY
+    若永豐登入失敗，自動 fallback 到證交所/櫃買 OpenAPI
+    """
     stock_map = {}
-    for code, info in twstock.twse.items():
-        if len(code) == 4 and code.isdigit():
-            stock_map[code] = {"symbol": f"{code}.TW",  "name": info.name, "market": "TWSE"}
-    for code, info in twstock.tpex.items():
-        if len(code) == 4 and code.isdigit():
-            stock_map[code] = {"symbol": f"{code}.TWO", "name": info.name, "market": "TPEX"}
+
+    # ── 方法一：永豐金 Shioaji 合約（最完整）──
+    sj_api_key    = os.environ.get("SJ_API_KEY", "")
+    sj_secret_key = os.environ.get("SJ_SECRET_KEY", "")
+
+    if sj_api_key and sj_secret_key:
+        try:
+            import shioaji as sj
+            api = sj.Shioaji(simulation=True)
+            api.login(api_key=sj_api_key, secret_key=sj_secret_key, fetch_contract=True)
+            for c in api.Contracts.Stocks.TSE:
+                if len(c.code) == 4 and c.code.isdigit():
+                    stock_map[c.code] = {"symbol": f"{c.code}.TW", "name": c.name, "market": "TWSE"}
+            for c in api.Contracts.Stocks.OTC:
+                if len(c.code) == 4 and c.code.isdigit():
+                    stock_map[c.code] = {"symbol": f"{c.code}.TWO", "name": c.name, "market": "TPEX"}
+            try:
+                api.logout()
+            except Exception:
+                pass
+            print(f"   永豐合約：共 {len(stock_map)} 支")
+            return stock_map
+        except Exception as e:
+            print(f"   ⚠️  永豐登入失敗（{e}），改用 OpenAPI fallback")
+
+    # ── 方法二：證交所 / 櫃買 OpenAPI（fallback）──
+    import requests
+    try:
+        r = requests.get(
+            "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=15
+        )
+        for row in r.json():
+            code = str(row.get("Code", "")).strip()
+            if len(code) == 4 and code.isdigit():
+                stock_map[code] = {"symbol": f"{code}.TW", "name": row.get("Name", ""), "market": "TWSE"}
+    except Exception as e:
+        print(f"   ⚠️  證交所 OpenAPI 失敗: {e}")
+    try:
+        r = requests.get(
+            "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=15
+        )
+        for row in r.json():
+            code = str(row.get("SecuritiesCompanyCode", "")).strip()
+            if len(code) == 4 and code.isdigit():
+                stock_map[code] = {"symbol": f"{code}.TWO", "name": row.get("CompanyName", ""), "market": "TPEX"}
+    except Exception as e:
+        print(f"   ⚠️  櫃買 OpenAPI 失敗: {e}")
+
+    print(f"   OpenAPI fallback：共 {len(stock_map)} 支")
     return stock_map
 
 # ==========================================
