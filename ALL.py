@@ -1,8 +1,8 @@
 # ==========================================
-# 強勢股戰情室 V19 (純永豐強護版)
+# 強勢股戰情室 V18 (純永豐強護版)
 # V2~V16: 歷史更新與 Bug 修正
-# V19_beta: 新增「🔧 系統診斷」分頁
-# V19: 🚀 終極進化版
+# V17_beta: 新增「🔧 系統診斷」分頁
+# V18: 🚀 終極進化版
 #      - 完全移除 twstock 與 證交所盤後 API 依賴。
 #      - 全面導入 永豐金 Shioaji API 作為 24H 唯一報價引擎。
 #      - (修復) 修正大盤無資料時的字串格式化 ValueError。
@@ -11,7 +11,6 @@
 # ==========================================
 import streamlit as st
 import os
-import tempfile
 import yfinance as yf
 import pandas as pd
 import concurrent.futures
@@ -65,7 +64,7 @@ warnings.filterwarnings("ignore")
 # ⚙️ 頁面設定
 # ==========================================
 st.set_page_config(
-    page_title="強勢股戰情室 V19",
+    page_title="強勢股戰情室 V18",
     page_icon="🔥",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -99,39 +98,18 @@ st.markdown("""
 # ==========================================
 @st.cache_resource
 def get_shioaji_api():
-    """初始化並登入永豐金 Shioaji API（含憑證啟用）"""
+    """初始化並登入永豐金 Shioaji API"""
     if "shioaji" not in st.secrets:
         st.error("❌ 找不到永豐金 API 金鑰！請在 `.streamlit/secrets.toml` 中設定 `[shioaji]` 的 `api_key` 與 `secret_key`。")
         st.stop()
-
-    sj_secrets = st.secrets["shioaji"]
-    api = sj.Shioaji(simulation=False)
-    ca_path = None
+        
+    api = sj.Shioaji(simulation=True)
     try:
         api.login(
-            api_key=sj_secrets["api_key"],
-            secret_key=sj_secrets["secret_key"],
+            api_key=st.secrets["shioaji"]["api_key"],
+            secret_key=st.secrets["shioaji"]["secret_key"],
             fetch_contract=True
         )
-        # 憑證啟用（若 secrets 有設定 ca_cert_base64）
-        if "ca_cert_base64" in sj_secrets:
-            try:
-                import base64 as _b64
-                cert_bytes = _b64.b64decode(sj_secrets["ca_cert_base64"])
-                with tempfile.NamedTemporaryFile(suffix=".pfx", delete=False) as f:
-                    f.write(cert_bytes)
-                    ca_path = f.name
-                result = api.activate_ca(
-                    ca_path=ca_path,
-                    ca_passwd=sj_secrets.get("ca_passwd", ""),
-                    person_id=sj_secrets.get("ca_person_id", ""),
-                )
-                logger.info(f"憑證啟用：{result}")
-            except Exception as e:
-                logger.warning(f"憑證啟用失敗（不影響行情）: {e}")
-            finally:
-                if ca_path and os.path.exists(ca_path):
-                    os.unlink(ca_path)
         return api
     except Exception as e:
         st.error(f"🔴 永豐金 API 登入失敗: {e}")
@@ -298,7 +276,7 @@ def bull_calc_indicators(df, params):
     df["Bandwidth"] = df["Upper"] - df["Lower"]; df["Vol_MA"] = volume.rolling(params["vol_ma_days"]).mean()
     df["Is_Squeeze"] = df["Bandwidth"] == df["Bandwidth"].rolling(params["squeeze_n"]).min()
     df["Squeeze_Recent"] = df["Is_Squeeze"].shift(1).rolling(params["squeeze_lookback"]).max() == 1
-    df["SMA_Up"] = df["SMA"] >= df["SMA"].shift(params["sma_trend_days"]) * 0.99  # 容忍 1%，避免盤整期均線微幅震盪被過濾
+    df["SMA_Up"] = df["SMA"] > df["SMA"].shift(params["sma_trend_days"])
     df["Vol_MA20"] = volume.rolling(params["vol_ma20_days"]).mean()
     df["Vol_Heavy"] = volume.rolling(params["vol_heavy_days"]).mean()
     df["Vol_Shrink"] = volume.rolling(params["vol_shrink_days"]).mean()
@@ -686,7 +664,7 @@ def run_backtest_ui(df, stock_input, params):
 # ==========================================
 # 🖥️ 介面主程式
 # ==========================================
-st.sidebar.title("🔥 強勢股戰情室 V19")
+st.sidebar.title("🔥 強勢股戰情室 V18")
 st.sidebar.caption("純永豐金 API 企業級 24H 連線版")
 
 if os.path.exists(PARQUET_PATH):
@@ -718,7 +696,7 @@ with st.sidebar.expander("🟢 狙擊手策略參數 (波段)", expanded=False):
     s_pullback_max = st.slider("整理回測深度上限 (%)", 20, 70, 50, 5)
 
 with st.sidebar.expander("🎯 處置股策略參數", expanded=False):
-    d_show_all = st.checkbox("顯示全部（含無訊號）", value=True) # 🔧 已預設為 True
+    d_show_all = st.checkbox("顯示全部（含無訊號）", value=False)
     d_vol_filter = st.checkbox("啟用底量濾網", value=False)
     d_min_vol_disp = st.number_input("底量門檻（張）", min_value=0, max_value=10000, value=1000, step=100, disabled=not d_vol_filter)
 
@@ -999,28 +977,28 @@ with tab3:
         with bt1:
             if not bull_res['entry']: st.info("今日無進場訊號")
             else:
-                st.dataframe(pd.DataFrame(bull_res['entry']), use_container_width=True, hide_index=True); cols = st.columns(min(len(bull_res['entry']), 6))
+                _bull_df_entry = pd.DataFrame(bull_res['entry']); st.dataframe(_bull_df_entry, use_container_width=True, hide_index=True, height=(_bull_df_entry.shape[0]+1)*35+3); cols = st.columns(min(len(bull_res['entry']), 6))
                 for i, r in enumerate(bull_res['entry']):
                     with cols[i % 6]:
                         if st.button(f"✅ 加入 {r['代號']}", key=f"bull_add_{r['symbol']}"): bull_add_pos(r['symbol'], r['名稱'], r['收盤價'], analysis_date_str); st.success(f"{r['代號']} 已加入持倉"); st.rerun()
         with bt2:
             if not bull_res['addon_b']: st.info("今日無加碼B訊號")
             else:
-                st.dataframe(pd.DataFrame(bull_res['addon_b']), use_container_width=True, hide_index=True); cols = st.columns(min(len(bull_res['addon_b']), 6))
+                _bull_df_addon_b = pd.DataFrame(bull_res['addon_b']); st.dataframe(_bull_df_addon_b, use_container_width=True, hide_index=True, height=(_bull_df_addon_b.shape[0]+1)*35+3); cols = st.columns(min(len(bull_res['addon_b']), 6))
                 for i, r in enumerate(bull_res['addon_b']):
                     with cols[i % 6]:
                         if st.button(f"🔵 加碼B {r['代號']}", key=f"bull_addb_{r['symbol']}"): bull_do_addon(r['symbol'], "突破新高", r['收盤價'], analysis_date_str); st.success(f"{r['代號']} 加碼B完成"); st.rerun()
         with bt3:
             if not bull_res['addon_a']: st.info("今日無加碼A訊號")
             else:
-                st.dataframe(pd.DataFrame(bull_res['addon_a']), use_container_width=True, hide_index=True); cols = st.columns(min(len(bull_res['addon_a']), 6))
+                _bull_df_addon_a = pd.DataFrame(bull_res['addon_a']); st.dataframe(_bull_df_addon_a, use_container_width=True, hide_index=True, height=(_bull_df_addon_a.shape[0]+1)*35+3); cols = st.columns(min(len(bull_res['addon_a']), 6))
                 for i, r in enumerate(bull_res['addon_a']):
                     with cols[i % 6]:
                         if st.button(f"🟡 加碼A {r['代號']}", key=f"bull_adda_{r['symbol']}"): bull_do_addon(r['symbol'], "回測站回", r['收盤價'], analysis_date_str); st.success(f"{r['代號']} 加碼A完成"); st.rerun()
         with bt4:
             if not bull_res['exit']: st.info("今日無出場訊號")
             else:
-                st.dataframe(pd.DataFrame(bull_res['exit']), use_container_width=True, hide_index=True); cols = st.columns(min(len(bull_res['exit']), 6))
+                _bull_df_exit = pd.DataFrame(bull_res['exit']); st.dataframe(_bull_df_exit, use_container_width=True, hide_index=True, height=(_bull_df_exit.shape[0]+1)*35+3); cols = st.columns(min(len(bull_res['exit']), 6))
                 for i, r in enumerate(bull_res['exit']):
                     with cols[i % 6]:
                         if st.button(f"🚪 出場 {r['代號']}", key=f"bull_exit_{r['symbol']}"): bull_remove_pos(r['symbol']); st.success(f"{r['代號']} 已出場"); st.rerun()
