@@ -1,8 +1,8 @@
 # ==========================================
-# 強勢股戰情室 V18 (純永豐強護版)
+# 強勢股戰情室 V19 (純永豐強護版)
 # V2~V16: 歷史更新與 Bug 修正
-# V17_beta: 新增「🔧 系統診斷」分頁
-# V18: 🚀 終極進化版
+# V19_beta: 新增「🔧 系統診斷」分頁
+# V19: 🚀 終極進化版
 #      - 完全移除 twstock 與 證交所盤後 API 依賴。
 #      - 全面導入 永豐金 Shioaji API 作為 24H 唯一報價引擎。
 #      - (修復) 修正大盤無資料時的字串格式化 ValueError。
@@ -11,6 +11,7 @@
 # ==========================================
 import streamlit as st
 import os
+import tempfile
 import yfinance as yf
 import pandas as pd
 import concurrent.futures
@@ -64,7 +65,7 @@ warnings.filterwarnings("ignore")
 # ⚙️ 頁面設定
 # ==========================================
 st.set_page_config(
-    page_title="強勢股戰情室 V18",
+    page_title="強勢股戰情室 V19",
     page_icon="🔥",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -98,18 +99,39 @@ st.markdown("""
 # ==========================================
 @st.cache_resource
 def get_shioaji_api():
-    """初始化並登入永豐金 Shioaji API"""
+    """初始化並登入永豐金 Shioaji API（含憑證啟用）"""
     if "shioaji" not in st.secrets:
         st.error("❌ 找不到永豐金 API 金鑰！請在 `.streamlit/secrets.toml` 中設定 `[shioaji]` 的 `api_key` 與 `secret_key`。")
         st.stop()
-        
-    api = sj.Shioaji(simulation=True)
+
+    sj_secrets = st.secrets["shioaji"]
+    api = sj.Shioaji(simulation=False)
+    ca_path = None
     try:
         api.login(
-            api_key=st.secrets["shioaji"]["api_key"],
-            secret_key=st.secrets["shioaji"]["secret_key"],
+            api_key=sj_secrets["api_key"],
+            secret_key=sj_secrets["secret_key"],
             fetch_contract=True
         )
+        # 憑證啟用（若 secrets 有設定 ca_cert_base64）
+        if "ca_cert_base64" in sj_secrets:
+            try:
+                import base64 as _b64
+                cert_bytes = _b64.b64decode(sj_secrets["ca_cert_base64"])
+                with tempfile.NamedTemporaryFile(suffix=".pfx", delete=False) as f:
+                    f.write(cert_bytes)
+                    ca_path = f.name
+                result = api.activate_ca(
+                    ca_path=ca_path,
+                    ca_passwd=sj_secrets.get("ca_passwd", ""),
+                    person_id=sj_secrets.get("ca_person_id", ""),
+                )
+                logger.info(f"憑證啟用：{result}")
+            except Exception as e:
+                logger.warning(f"憑證啟用失敗（不影響行情）: {e}")
+            finally:
+                if ca_path and os.path.exists(ca_path):
+                    os.unlink(ca_path)
         return api
     except Exception as e:
         st.error(f"🔴 永豐金 API 登入失敗: {e}")
@@ -276,7 +298,7 @@ def bull_calc_indicators(df, params):
     df["Bandwidth"] = df["Upper"] - df["Lower"]; df["Vol_MA"] = volume.rolling(params["vol_ma_days"]).mean()
     df["Is_Squeeze"] = df["Bandwidth"] == df["Bandwidth"].rolling(params["squeeze_n"]).min()
     df["Squeeze_Recent"] = df["Is_Squeeze"].shift(1).rolling(params["squeeze_lookback"]).max() == 1
-    df["SMA_Up"] = df["SMA"] > df["SMA"].shift(params["sma_trend_days"])
+    df["SMA_Up"] = df["SMA"] >= df["SMA"].shift(params["sma_trend_days"]) * 0.99  # 容忍 1%，避免盤整期均線微幅震盪被過濾
     df["Vol_MA20"] = volume.rolling(params["vol_ma20_days"]).mean()
     df["Vol_Heavy"] = volume.rolling(params["vol_heavy_days"]).mean()
     df["Vol_Shrink"] = volume.rolling(params["vol_shrink_days"]).mean()
@@ -664,7 +686,7 @@ def run_backtest_ui(df, stock_input, params):
 # ==========================================
 # 🖥️ 介面主程式
 # ==========================================
-st.sidebar.title("🔥 強勢股戰情室 V18")
+st.sidebar.title("🔥 強勢股戰情室 V19")
 st.sidebar.caption("純永豐金 API 企業級 24H 連線版")
 
 if os.path.exists(PARQUET_PATH):
