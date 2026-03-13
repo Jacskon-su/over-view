@@ -110,12 +110,35 @@ def get_shioaji_api():
             secret_key=st.secrets["shioaji"]["secret_key"],
             fetch_contract=True
         )
-        return api
     except Exception as e:
         st.error(f"🔴 永豐金 API 登入失敗: {e}")
         st.stop()
 
-api = get_shioaji_api()
+    # 啟用 CA 憑證
+    try:
+        ca_b64   = st.secrets["shioaji"].get("ca_cert_base64", "")
+        ca_pass  = st.secrets["shioaji"].get("ca_passwd", "")
+        ca_pid   = st.secrets["shioaji"].get("ca_person_id", "")
+        if ca_b64 and ca_pass and ca_pid:
+            import base64, tempfile
+            ca_bytes = base64.b64decode(ca_b64)
+            with tempfile.NamedTemporaryFile(suffix=".pfx", delete=False) as f:
+                f.write(ca_bytes); ca_path = f.name
+            api.activate_ca(ca_path=ca_path, ca_passwd=ca_pass, person_id=ca_pid)
+            import os; os.remove(ca_path)
+            logger.info("✅ CA 憑證啟用成功")
+        else:
+            logger.warning("⚠️ CA 憑證資訊不完整，跳過啟用")
+    except Exception as e:
+        logger.warning(f"⚠️ CA 憑證啟用失敗（不中斷）: {e}")
+
+    return api
+
+try:
+    api = get_shioaji_api()
+except Exception as _api_err:
+    st.error(f"❌ 啟動失敗: {_api_err}")
+    st.stop()
 
 def is_trading_hours():
     now = _now_tw()
@@ -211,12 +234,15 @@ def get_stock_data_with_realtime(code, symbol, analysis_date_str, _api_instance)
     today_str = _now_tw().strftime('%Y-%m-%d')
     if analysis_date_str == today_str and df.index[-1].strftime('%Y-%m-%d') != today_str:
         try:
-            contract = _api_instance.Contracts.Stocks.get(str(code))
+            try:
+                contract = _api_instance.Contracts.Stocks[str(code)]
+            except Exception:
+                contract = None
             if contract:
                 snapshots = _api_instance.snapshots([contract])
                 if snapshots:
                     snap = snapshots[0]
-                    c_p = snap.close if snap.close > 0 else snap.previous_close
+                    c_p = snap.close if snap.close > 0 else (snap.close - getattr(snap, 'change_price', 0))
                     if c_p > 0:
                         new_row = pd.Series({'Open': snap.open if snap.open > 0 else c_p, 'High': snap.high if snap.high > 0 else c_p, 'Low': snap.low if snap.low > 0 else c_p, 'Close': c_p, 'Volume': snap.total_volume * 1000}, name=pd.Timestamp(today_str))
                         df = pd.concat([df, new_row.to_frame().T])
@@ -398,9 +424,11 @@ def fetch_realtime_batch(codes_list, _api_instance, status_text=None):
         contracts = []
         for c in codes_list:
             c_str = str(c)
-            # 🔧 增強: 更安全的合約抓取方式
-            contract = _api_instance.Contracts.Stocks.get(c_str)
-            if contract: contracts.append(contract)
+            try:
+                contract = _api_instance.Contracts.Stocks[c_str]
+                if contract: contracts.append(contract)
+            except Exception:
+                pass
             
         total_c = len(contracts)
         if total_c > 0:
@@ -408,7 +436,7 @@ def fetch_realtime_batch(codes_list, _api_instance, status_text=None):
             for i in range(0, total_c, 300):
                 chunk = contracts[i:i + 300]
                 for snap in _api_instance.snapshots(chunk):
-                    c_price = snap.close if snap.close > 0 else snap.previous_close
+                    c_price = snap.close if snap.close > 0 else (snap.close - getattr(snap, 'change_price', 0))
                     realtime_data[str(snap.code)] = {
                         "latest_trade_price": str(c_price), "open": str(snap.open if snap.open > 0 else c_price),
                         "high": str(snap.high if snap.high > 0 else c_price), "low": str(snap.low if snap.low > 0 else c_price),
@@ -437,7 +465,7 @@ def fetch_market_status(analysis_date_str, _api_instance=None):
         if _api_instance and analysis_date_str == today_str:
             try:
                 if snap := _api_instance.snapshots([_api_instance.Contracts.Indices.TSE.TSE001]):
-                    rt_c = snap[0].close if snap[0].close > 0 else snap[0].previous_close
+                    rt_c = snap[0].close if snap[0].close > 0 else (snap[0].close - getattr(snap[0], 'change_price', 0))
                     today_ts = pd.Timestamp(today_str)
                     if today_ts in df.index: df.loc[today_ts, 'Close'] = rt_c
                     else: df = pd.concat([df, pd.Series({'Close': rt_c}, name=today_ts).to_frame().T])
@@ -511,8 +539,9 @@ def analyze_disposal_stock(code, info, analysis_date, min_vol=0):
 def show_disposal_table(data):
     if not data: return
     df = pd.DataFrame(data)
-    col_map = {'code': '代號', 'name': '名稱', 'market': '市場', 'disposal_start': '處置開始', 'disposal_end': '處置結束', 'days_left': '剩餘天數', 'status': '狀態', 'entry_date': '進場日', 'entry_price': '進場價', 'exit_date': '出場日', 'exit_price': '出場價', 'profit_pct': '損益', 'exit_reason': '出場條件', 'signal_date': '訊號日', 'signal_close': '訊號收盤', 'signal_prev_high': '前日高點', 'signal_pct': '訊號漲幅'}
-    st.dataframe(df[[c for c in col_map if c in df.columns]].rename(columns=col_map), width='stretch', hide_index=True)
+    col_map = {'code': '代號', 'name': '名稱', 'market': '市場', 'disposal_start': '處置開始', 'disposal_end': '處置結束', 'days_left': '剩餘天數', 'status': '狀態', 'signal_date': '訊號日', 'signal_close': '訊號收盤', 'signal_prev_high': '前日高點', 'signal_pct': '訊號漲幅'}
+    _df = df[[c for c in col_map if c in df.columns]].rename(columns=col_map)
+    st.dataframe(_df, use_container_width=True, hide_index=True, height=(_df.shape[0]+1)*35+3)
 
 # ==========================================
 # 🏆 綜合分析引擎與評分
@@ -930,10 +959,41 @@ with tab2:
                 st.dataframe(pd.DataFrame([{'代號': k, '名稱': v['name'], '市場': '上市' if v['market'] == 'twse' else '上櫃', '處置開始': v['start'].strftime('%Y-%m-%d'), '處置結束': v['end'].strftime('%Y-%m-%d')} for k, v in d_active_coming.items()]), use_container_width=True, hide_index=True)
             else: st.info(f"基準日 {analysis_date_str} 無今日訊號")
 
-        if d_holding: st.divider(); st.markdown(f"#### 🟢 持有中 ({len(d_holding)} 支)"); show_disposal_table(d_holding)
-        if d_exited: st.divider(); st.markdown(f"#### ⚫ 已出場 ({len(d_exited)} 支)"); show_disposal_table(d_exited)
         if d_show_all and d_no_signal: st.divider(); st.markdown(f"#### ⚪ 無訊號 ({len(d_no_signal)} 支)"); show_disposal_table(d_no_signal)
-        st.divider(); c1, c2, c3, c4 = st.columns(4); c1.metric("處置中", f"{len(d_active_now)} 支"); c2.metric("今日新訊號", f"{len(d_new_today)} 支"); c3.metric("持有中", f"{len(d_holding) + len(d_new_today)} 支"); c4.metric("已出場", f"{len(d_exited)} 支")
+
+        # 目前所有處置股清單
+        st.divider()
+        st.markdown(f"#### 📋 目前處置中股票（{len(d_active_now)} 支）")
+        if d_active_now:
+            _df_now = pd.DataFrame([{
+                '代號': k, '名稱': v['name'],
+                '市場': '上市' if v['market'] == 'twse' else '上櫃',
+                '處置開始': v['start'].strftime('%Y-%m-%d'),
+                '處置結束': v['end'].strftime('%Y-%m-%d'),
+                '剩餘天數': max((v['end'] - analysis_date_input).days, 0)
+            } for k, v in d_active_now.items()])
+            st.dataframe(_df_now, use_container_width=True, hide_index=True, height=(_df_now.shape[0]+1)*35+3)
+        else:
+            st.info("目前無處置中股票")
+
+        # 即將處置清單
+        if d_active_coming:
+            st.divider()
+            st.markdown(f"#### 🔔 即將進入處置（{len(d_active_coming)} 支）")
+            _df_coming = pd.DataFrame([{
+                '代號': k, '名稱': v['name'],
+                '市場': '上市' if v['market'] == 'twse' else '上櫃',
+                '處置開始': v['start'].strftime('%Y-%m-%d'),
+                '處置結束': v['end'].strftime('%Y-%m-%d'),
+                '距今天數': (v['start'] - analysis_date_input).days
+            } for k, v in d_active_coming.items()])
+            st.dataframe(_df_coming, use_container_width=True, hide_index=True, height=(_df_coming.shape[0]+1)*35+3)
+
+        st.divider()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("處置中", f"{len(d_active_now)} 支")
+        c2.metric("今日新訊號", f"{len(d_new_today)} 支")
+        c3.metric("即將處置", f"{len(d_active_coming)} 支")
     else: st.info("👈 請點擊左側「開始全域掃描」按鈕。")
 
 with tab3:
@@ -1067,7 +1127,7 @@ with tab6:
                     st.success("✅ Shioaji API 連線與資料獲取皆正常！")
                     rows_diag = []
                     for snap in snapshots:
-                        c_p = snap.close if snap.close > 0 else snap.previous_close
+                        c_p = snap.close if snap.close > 0 else (snap.close - getattr(snap, 'change_price', 0))
                         rows_diag.append({
                             "代號": snap.code,
                             "最新價": c_p,
@@ -1081,6 +1141,19 @@ with tab6:
                     st.error("❌ 登入成功但無法取得快照資料")
             except Exception as e:
                 st.error(f"❌ Shioaji 發生錯誤: {e}")
+
+        # 1b. 合約數量檢查
+        st.subheader("1b. 合約載入狀況")
+        try:
+            tse_contracts = list(api.Contracts.Stocks.TSE)
+            otc_contracts = list(api.Contracts.Stocks.OTC)
+            st.info(f"TSE 合約: **{len(tse_contracts)}** 支 ｜ OTC 合約: **{len(otc_contracts)}** 支 ｜ 合計: **{len(tse_contracts)+len(otc_contracts)}** 支")
+            if len(tse_contracts) + len(otc_contracts) < 100:
+                st.error("⚠️ 合約數量異常偏少，可能是 fetch_contract 尚未完成或 simulation 模式限制")
+            else:
+                st.success("✅ 合約載入正常")
+        except Exception as e:
+            st.error(f"❌ 合約檢查失敗: {e}")
 
         # 2. Parquet 歷史資料
         st.subheader("2. 歷史資料 data/history.parquet")
