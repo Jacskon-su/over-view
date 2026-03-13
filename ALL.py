@@ -103,7 +103,7 @@ def get_shioaji_api():
         st.error("❌ 找不到永豐金 API 金鑰！請在 `.streamlit/secrets.toml` 中設定 `[shioaji]` 的 `api_key` 與 `secret_key`。")
         st.stop()
         
-    api = sj.Shioaji(simulation=False)
+    api = sj.Shioaji(simulation=True)
     try:
         api.login(
             api_key=st.secrets["shioaji"]["api_key"],
@@ -230,7 +230,10 @@ def get_stock_data_with_realtime(code, symbol, analysis_date_str, _api_instance)
     today_str = _now_tw().strftime('%Y-%m-%d')
     if analysis_date_str == today_str and df.index[-1].strftime('%Y-%m-%d') != today_str:
         try:
-            contract = _api_instance.Contracts.Stocks.TSE.get(str(code)) or _api_instance.Contracts.Stocks.OTC.get(str(code))
+            try:
+                contract = _api_instance.Contracts.Stocks[str(code)]
+            except Exception:
+                contract = None
             if contract:
                 snapshots = _api_instance.snapshots([contract])
                 if snapshots:
@@ -417,9 +420,11 @@ def fetch_realtime_batch(codes_list, _api_instance, status_text=None):
         contracts = []
         for c in codes_list:
             c_str = str(c)
-            # 🔧 增強: 更安全的合約抓取方式
-            contract = _api_instance.Contracts.Stocks.TSE.get(c_str) or _api_instance.Contracts.Stocks.OTC.get(c_str)
-            if contract: contracts.append(contract)
+            try:
+                contract = _api_instance.Contracts.Stocks[c_str]
+                if contract: contracts.append(contract)
+            except Exception:
+                pass
             
         total_c = len(contracts)
         if total_c > 0:
