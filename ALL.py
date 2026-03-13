@@ -134,7 +134,11 @@ def get_shioaji_api():
 
     return api
 
-api = get_shioaji_api()
+try:
+    api = get_shioaji_api()
+except Exception as _api_err:
+    st.error(f"❌ 啟動失敗: {_api_err}")
+    st.stop()
 
 def is_trading_hours():
     now = _now_tw()
