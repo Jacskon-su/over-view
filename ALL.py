@@ -8,6 +8,7 @@
 #      - (修復) 修正大盤無資料時的字串格式化 ValueError。
 #      - (修復) 解決 Parquet 型態與 API 型態不一致導致股票被清空的 Bug。
 #      - (修復) 加入 Pandas Index 去重防呆，完美解決盤中快照寫入失敗/報錯的問題。
+#      - (優化) 修正 Shioaji 快照批次過大與頻率限制導致的漏抓問題。
 # ==========================================
 import streamlit as st
 import os
@@ -433,20 +434,45 @@ def fetch_realtime_batch(codes_list, _api_instance, status_text=None):
         total_c = len(contracts)
         if total_c > 0:
             _txt.text(f"⚡ 永豐金快照擷取中 (共 {total_c} 支)...")
-            for i in range(0, total_c, 300):
-                chunk = contracts[i:i + 300]
-                for snap in _api_instance.snapshots(chunk):
-                    c_price = snap.close if snap.close > 0 else (snap.close - getattr(snap, 'change_price', 0))
-                    realtime_data[str(snap.code)] = {
-                        "latest_trade_price": str(c_price), "open": str(snap.open if snap.open > 0 else c_price),
-                        "high": str(snap.high if snap.high > 0 else c_price), "low": str(snap.low if snap.low > 0 else c_price),
-                        "accumulate_trade_volume": str(int(snap.total_volume))
-                    }
-                rt_bar.progress(min(100, int((i + 300) / total_c * 100)))
             
-        rt_bar.progress(100); _txt.text(f"✅ 報價快照 (永豐金) 更新完成｜成功取得 {len(realtime_data)} 支")
+            # 🛠️ 修正 1：將每批次數量從 300 縮小至 100，減輕 Server 單次負擔
+            chunk_size = 100 
+            for i in range(0, total_c, chunk_size):
+                chunk = contracts[i:i + chunk_size]
+                
+                # 🛠️ 修正 2：加入 Retry (重試) 機制，容錯網路波動與 Server 漏拍
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        snaps = _api_instance.snapshots(chunk)
+                        # 確保回傳有資料才進行處理
+                        if snaps:
+                            for snap in snaps:
+                                c_price = snap.close if snap.close > 0 else (snap.close - getattr(snap, 'change_price', 0))
+                                realtime_data[str(snap.code)] = {
+                                    "latest_trade_price": str(c_price), "open": str(snap.open if snap.open > 0 else c_price),
+                                    "high": str(snap.high if snap.high > 0 else c_price), "low": str(snap.low if snap.low > 0 else c_price),
+                                    "accumulate_trade_volume": str(int(snap.total_volume))
+                                }
+                            break  # 成功取得資料，跳出重試迴圈
+                        else:
+                            logger.warning(f"批次 {i} 取得空資料，準備重試...")
+                    except Exception as e:
+                        logger.warning(f"批次 {i} 擷取失敗 (嘗試 {attempt+1}/{max_retries}): {e}")
+                        
+                    # 🛠️ 修正 3：加入延遲，避免短時間內對 API 送出過多請求觸發限制
+                    time.sleep(0.5)
+                    
+                # 更新進度條
+                rt_bar.progress(min(100, int((i + chunk_size) / total_c * 100)))
+            
+        rt_bar.progress(100)
+        _txt.text(f"✅ 報價快照 (永豐金) 更新完成｜成功取得 {len(realtime_data)} 支")
     except Exception as e:
-        logger.error(f"Shioaji 快照抓取錯誤: {e}"); _txt.text(f"❌ 永豐金連線異常: {e}"); rt_bar.progress(100)
+        logger.error(f"Shioaji 快照抓取錯誤: {e}")
+        _txt.text(f"❌ 永豐金連線異常: {e}")
+        rt_bar.progress(100)
+        
     return realtime_data
 
 # ==========================================
