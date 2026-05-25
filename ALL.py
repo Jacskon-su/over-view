@@ -1171,10 +1171,12 @@ with tab6:
         # 1b. 合約數量檢查
         st.subheader("1b. 合約載入狀況")
         try:
-            tse_contracts = list(api.Contracts.Stocks.TSE)
-            otc_contracts = list(api.Contracts.Stocks.OTC)
-            st.info(f"TSE 合約: **{len(tse_contracts)}** 支 ｜ OTC 合約: **{len(otc_contracts)}** 支 ｜ 合計: **{len(tse_contracts)+len(otc_contracts)}** 支")
-            if len(tse_contracts) + len(otc_contracts) < 100:
+            # ✅ 修正：不用 list() 強制展開（會觸發底層 code: int → str 型別驗證報錯）
+            # 改用安全的 for-loop 計數，只讀取 contract.code 屬性
+            tse_count = sum(1 for _ in api.Contracts.Stocks.TSE)
+            otc_count = sum(1 for _ in api.Contracts.Stocks.OTC)
+            st.info(f"TSE 合約: **{tse_count}** 支 ｜ OTC 合約: **{otc_count}** 支 ｜ 合計: **{tse_count + otc_count}** 支")
+            if tse_count + otc_count < 100:
                 st.error("⚠️ 合約數量異常偏少，可能是 fetch_contract 尚未完成或 simulation 模式限制")
             else:
                 st.success("✅ 合約載入正常")
