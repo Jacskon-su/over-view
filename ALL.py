@@ -1168,37 +1168,22 @@ with tab6:
             except Exception as e:
                 st.error(f"❌ Shioaji 發生錯誤: {e}")
 
-       # 1b. 合約數量檢查 (強制修復防崩潰版)
+      # 1b. 合約數量檢查 (徹底避開型態錯誤的靜態檢查法)
         st.subheader("1b. 合約載入狀況")
         try:
-            # 絕對不要使用 list(api.Contracts.Stocks.TSE)
-            # 因為這會導致所有合約一次性觸發檢查，碰到地雷就會當機
-            # 我們改用一個一個取，並加上 try-except 跳過壞資料
-            def count_safe(contracts):
-                count = 0
-                for c in contracts:
-                    try:
-                        # 只要這個物件可以讀，且它的 code 轉字串沒報錯，就算一支
-                        if c and hasattr(c, 'code'):
-                            str(c.code)
-                            count += 1
-                    except:
-                        # 碰到那個 int 格式的地雷權證，我們直接跳過，不讓它影響整體
-                        continue
-                return count
-
-            tse_count = count_safe(api.Contracts.Stocks.TSE)
-            otc_count = count_safe(api.Contracts.Stocks.OTC)
+            # 絕對不要使用 list() 或 len()，這會強制遍歷所有資料，觸發底層檢查
+            # 我們改用一個簡單的 try-except 來確認 API 是否能存取特定已知代號即可
+            test_code = "2330" 
+            contract = api.Contracts.Stocks[test_code]
             
-            st.info(f"TSE 合約: **{tse_count}** 支 ｜ OTC 合約: **{otc_count}** 支 ｜ 合計: **{tse_count + otc_count}** 支")
-            
-            if (tse_count + otc_count) < 100:
-                st.error("⚠️ 合約數量異常偏少，可能是網路限制")
+            if contract:
+                st.success(f"✅ API 合約接口正常，已成功測試讀取代號: {test_code} ({contract.name})")
+                st.info("提示：為避免永豐 API 底層資料結構異常導致崩潰，已跳過全量合約檢查。")
             else:
-                st.success("✅ 合約載入正常")
+                st.error("❌ 無法取得測試合約，請確認 API 狀態。")
+                
         except Exception as e:
-            # 這裡能確保如果還是報錯，不會讓整頁空白，只會顯示紅字提示
-            st.error(f"❌ 合約讀取機制異常: {e}")
+            st.error(f"❌ API 接口無法存取: {e}")
 
         # 2. Parquet 歷史資料
         st.subheader("2. 歷史資料 data/history.parquet")
