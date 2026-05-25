@@ -1168,19 +1168,29 @@ with tab6:
             except Exception as e:
                 st.error(f"❌ Shioaji 發生錯誤: {e}")
 
-        # 1b. 合約數量檢查
+        # 1b. 合約數量檢查 (防呆修正版 - 確保縮排為4格)
         st.subheader("1b. 合約載入狀況")
         try:
-            # ✅ 修正：simulation 模式下 Shioaji 合約 code 為 int，任何迭代都會觸發
-            # 'int' object is not an instance of 'str' 驗證錯誤。
-            # 改用 get_stock_info_map 已安全過濾的結果來計數，完全不碰原始合約集合。
-            _smap = get_stock_info_map(api)
-            tse_count = sum(1 for v in _smap.values() if v.get('symbol', '').endswith('.TW'))
-            otc_count = sum(1 for v in _smap.values() if v.get('symbol', '').endswith('.TWO'))
-            total_count = len(_smap)
-            st.info(f"TSE 合約: **{tse_count}** 支 ｜ OTC 合約: **{otc_count}** 支 ｜ 合計: **{total_count}** 支")
-            if total_count < 100:
-                st.error("⚠️ 合約數量異常偏少，可能是 fetch_contract 尚未完成或 simulation 模式限制")
+            # 這裡我們手動迭代，避免 list() 強制轉型導致的 int 型態檢查錯誤
+            def safe_count(contracts):
+                count = 0
+                for c in contracts:
+                    try:
+                        # 只要能讀到 code 且不報錯，就計入
+                        if c and hasattr(c, 'code'):
+                            str(c.code)
+                            count += 1
+                    except:
+                        continue
+                return count
+
+            tse_count = safe_count(api.Contracts.Stocks.TSE)
+            otc_count = safe_count(api.Contracts.Stocks.OTC)
+            
+            st.info(f"TSE 合約: **{tse_count}** 支 ｜ OTC 合約: **{otc_count}** 支 ｜ 合計: **{tse_count + otc_count}** 支")
+            
+            if (tse_count + otc_count) < 100:
+                st.error("⚠️ 合約數量異常偏少，可能是網路連線不穩或權限限制")
             else:
                 st.success("✅ 合約載入正常")
         except Exception as e:
