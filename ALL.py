@@ -1171,12 +1171,15 @@ with tab6:
         # 1b. 合約數量檢查
         st.subheader("1b. 合約載入狀況")
         try:
-            # ✅ 修正：不用 list() 強制展開（會觸發底層 code: int → str 型別驗證報錯）
-            # 改用安全的 for-loop 計數，只讀取 contract.code 屬性
-            tse_count = sum(1 for _ in api.Contracts.Stocks.TSE)
-            otc_count = sum(1 for _ in api.Contracts.Stocks.OTC)
-            st.info(f"TSE 合約: **{tse_count}** 支 ｜ OTC 合約: **{otc_count}** 支 ｜ 合計: **{tse_count + otc_count}** 支")
-            if tse_count + otc_count < 100:
+            # ✅ 修正：simulation 模式下 Shioaji 合約 code 為 int，任何迭代都會觸發
+            # 'int' object is not an instance of 'str' 驗證錯誤。
+            # 改用 get_stock_info_map 已安全過濾的結果來計數，完全不碰原始合約集合。
+            _smap = get_stock_info_map(api)
+            tse_count = sum(1 for v in _smap.values() if v.get('symbol', '').endswith('.TW'))
+            otc_count = sum(1 for v in _smap.values() if v.get('symbol', '').endswith('.TWO'))
+            total_count = len(_smap)
+            st.info(f"TSE 合約: **{tse_count}** 支 ｜ OTC 合約: **{otc_count}** 支 ｜ 合計: **{total_count}** 支")
+            if total_count < 100:
                 st.error("⚠️ 合約數量異常偏少，可能是 fetch_contract 尚未完成或 simulation 模式限制")
             else:
                 st.success("✅ 合約載入正常")
