@@ -1168,33 +1168,37 @@ with tab6:
             except Exception as e:
                 st.error(f"❌ Shioaji 發生錯誤: {e}")
 
-        # 1b. 合約數量檢查 (防呆修正版 - 確保縮排為4格)
+       # 1b. 合約數量檢查 (強制修復防崩潰版)
         st.subheader("1b. 合約載入狀況")
         try:
-            # 這裡我們手動迭代，避免 list() 強制轉型導致的 int 型態檢查錯誤
-            def safe_count(contracts):
+            # 絕對不要使用 list(api.Contracts.Stocks.TSE)
+            # 因為這會導致所有合約一次性觸發檢查，碰到地雷就會當機
+            # 我們改用一個一個取，並加上 try-except 跳過壞資料
+            def count_safe(contracts):
                 count = 0
                 for c in contracts:
                     try:
-                        # 只要能讀到 code 且不報錯，就計入
+                        # 只要這個物件可以讀，且它的 code 轉字串沒報錯，就算一支
                         if c and hasattr(c, 'code'):
                             str(c.code)
                             count += 1
                     except:
+                        # 碰到那個 int 格式的地雷權證，我們直接跳過，不讓它影響整體
                         continue
                 return count
 
-            tse_count = safe_count(api.Contracts.Stocks.TSE)
-            otc_count = safe_count(api.Contracts.Stocks.OTC)
+            tse_count = count_safe(api.Contracts.Stocks.TSE)
+            otc_count = count_safe(api.Contracts.Stocks.OTC)
             
             st.info(f"TSE 合約: **{tse_count}** 支 ｜ OTC 合約: **{otc_count}** 支 ｜ 合計: **{tse_count + otc_count}** 支")
             
             if (tse_count + otc_count) < 100:
-                st.error("⚠️ 合約數量異常偏少，可能是網路連線不穩或權限限制")
+                st.error("⚠️ 合約數量異常偏少，可能是網路限制")
             else:
                 st.success("✅ 合約載入正常")
         except Exception as e:
-            st.error(f"❌ 合約檢查失敗: {e}")
+            # 這裡能確保如果還是報錯，不會讓整頁空白，只會顯示紅字提示
+            st.error(f"❌ 合約讀取機制異常: {e}")
 
         # 2. Parquet 歷史資料
         st.subheader("2. 歷史資料 data/history.parquet")
