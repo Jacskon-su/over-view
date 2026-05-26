@@ -1,4 +1,4 @@
-```python
+
 # ==========================================
 # 強勢股戰情室 V18 (純永豐強護版)
 # V2~V16: 歷史更新與 Bug 修正
@@ -618,7 +618,7 @@ with tab5:
         df = get_stock_data_with_realtime(stock_input, f"{stock_input}.TW", analysis_date_str, api)
         if df is not None: st.plotly_chart(plot_diagnosis_chart(df, stock_input, analysis_date_str, params), use_container_width=True)
         else: st.error("查無資料")
-
+ty
 with tab6:
     st.header("🔧 系統診斷")
     st.subheader("1. 測試連線")
@@ -633,4 +633,5 @@ with tab6:
     st.success("✅ 只要能在上方成功讀取 2330 快照，即代表全域掃描功能皆可正常運作！")
 
 
-```
+
+
