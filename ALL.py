@@ -1,4 +1,3 @@
-
 # ==========================================
 # 強勢股戰情室 V18 (精準除錯版)
 # V2~V16: 歷史更新與 Bug 修正
@@ -598,7 +597,35 @@ with tab3:
     st.metric("📋 持倉數量", pos_n)
     if not bull_res: st.info("請先執行全域掃描。")
     else:
-        st.success(f"掃描完成：進場 {len(bull_res.get('entry',[]))} 筆")
+        entry_list = bull_res.get('entry', [])
+        addon_a_list = bull_res.get('addon_a', [])
+        addon_b_list = bull_res.get('addon_b', [])
+        exit_list = bull_res.get('exit', [])
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("🟢 進場訊號", len(entry_list))
+        c2.metric("🔺 加碼A (回測站回)", len(addon_a_list))
+        c3.metric("🚀 加碼B (突破新高)", len(addon_b_list))
+        c4.metric("🔴 出場訊號", len(exit_list))
+        st.divider()
+
+        if entry_list:
+            st.markdown(f"#### 🟢 布林突破進場訊號 ({len(entry_list)} 筆)")
+            df_entry = pd.DataFrame(entry_list).sort_values(by='成交量', ascending=False)
+            display_full_table(df_entry)
+        else:
+            st.info("今日無布林突破進場訊號。")
+
+        if addon_a_list:
+            st.markdown(f"#### 🔺 加碼A：回測站回 ({len(addon_a_list)} 筆)")
+            display_full_table(pd.DataFrame(addon_a_list))
+
+        if addon_b_list:
+            st.markdown(f"#### 🚀 加碼B：突破新高 ({len(addon_b_list)} 筆)")
+            display_full_table(pd.DataFrame(addon_b_list))
+
+        if exit_list:
+            st.markdown(f"#### 🔴 出場訊號 ({len(exit_list)} 筆)")
+            display_full_table(pd.DataFrame(exit_list))
 
 with tab4:
     st.header("⚡ 隔日沖雷達")
@@ -633,7 +660,6 @@ with tab6:
         
     st.subheader("2. 合約防呆檢查")
     try:
-        # 使用安全的函式檢查，不觸發底層崩潰
         safe_map = get_stock_info_map(api)
         st.info(f"成功安全載入目標股票清單: **{len(safe_map)}** 支")
         if len(safe_map) > 1000:
@@ -643,5 +669,57 @@ with tab6:
     except Exception as e:
         st.error(f"合約檢查異常: {e}")
 
+    st.divider()
+    st.subheader("3. 歷史資料新鮮度檢查")
+    if not os.path.exists(PARQUET_PATH):
+        st.error(f"❌ 找不到 {PARQUET_PATH}，請先更新歷史資料庫。")
+    else:
+        try:
+            import datetime as _dt
+            df_check = pd.read_parquet(PARQUET_PATH, columns=["date", "code"])
+            df_check["date"] = pd.to_datetime(df_check["date"])
+            parquet_last_date = df_check["date"].max()
+            parquet_last_str = parquet_last_date.strftime("%Y-%m-%d")
+            total_stocks = df_check["code"].nunique()
+            file_size_mb = os.path.getsize(PARQUET_PATH) / 1024 / 1024
+
+            # 計算最近交易日（跳過週末）
+            today_tw = _now_tw().date()
+            check_day = today_tw - _dt.timedelta(days=1)
+            for _ in range(7):
+                if check_day.weekday() < 5:  # 0=Mon, 4=Fri
+                    break
+                check_day -= _dt.timedelta(days=1)
+            latest_trading_day = check_day
+
+            days_lag = (latest_trading_day - parquet_last_date.date()).days
+
+            col_a, col_b, col_c = st.columns(3)
+            col_a.metric("📅 Parquet 最新日期", parquet_last_str)
+            col_b.metric("📅 預估最近交易日", str(latest_trading_day))
+            col_c.metric("⏳ 落後天數", f"{days_lag} 天" if days_lag >= 0 else "超前0天")
+
+            st.info(f"📦 檔案大小：{file_size_mb:.1f} MB　|　股票數量：{total_stocks} 支")
+
+            if days_lag <= 0:
+                st.success("✅ 歷史資料為最新狀態，可直接掃描！")
+            elif days_lag <= 3:
+                st.warning(f"⚠️ 資料落後 {days_lag} 天（可能含假日），建議確認是否需要補資料。")
+            else:
+                st.error(f"🚨 資料已落後 {days_lag} 天！請執行 fetch_history.py 或資料更新腳本補齊。")
+
+            # 顯示各股最新日期分佈（前幾名落後股）
+            with st.expander("🔍 各股最新資料日期統計"):
+                stock_latest = df_check.groupby("code")["date"].max().reset_index()
+                stock_latest.columns = ["代號", "最新日期"]
+                stock_latest["最新日期"] = stock_latest["最新日期"].dt.strftime("%Y-%m-%d")
+                stale = stock_latest[stock_latest["最新日期"] < parquet_last_str]
+                st.write(f"資料日期不是最新的股票數：{len(stale)} 支（共 {total_stocks} 支）")
+                if not stale.empty:
+                    st.dataframe(stale.sort_values("最新日期").head(50), hide_index=True, use_container_width=True)
+                else:
+                    st.success("✅ 所有股票資料日期一致！")
+        except Exception as e:
+            st.error(f"❌ 資料新鮮度檢查失敗：{e}")
 
 
