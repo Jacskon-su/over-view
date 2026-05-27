@@ -126,7 +126,7 @@ def get_detailed_sector(code, standard_group=None, custom_db=None):
 PARQUET_PATH = "data/history.parquet"
 
 # 👇 籌碼資料庫 URL (請替換為你的實際網址)
-HF_CHIP_URL = "https://huggingface.co/datasets/請替換為你的帳號/請替換為你的資料集名稱/resolve/main/all_institutional_investors_2020_2026.parquet"
+HF_CHIP_URL = "https://huggingface.co/datasets/4340P/institutional_investors_parquet_by_stock/resolve/main/all_institutional_investors_2020_2026.parquet"
 
 @st.cache_data(ttl=3600*12, show_spinner=False)
 def load_cloud_chip_data(url):
