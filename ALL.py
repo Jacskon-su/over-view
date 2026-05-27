@@ -124,7 +124,7 @@ HF_CHIP_URL = "https://huggingface.co/datasets/4340P/institutional_investors_par
 
 @st.cache_data(ttl=3600*12, show_spinner=False)
 def load_cloud_chip_data(url):
-    """載入雲端法人籌碼資料 (強效洗檔除錯版)"""
+    """載入雲端法人籌碼資料 (中英雙語兼容版)"""
     url = url.replace("/blob/main/", "/resolve/main/")
     temp_file = "temp_chip_data.parquet"
     
@@ -137,26 +137,26 @@ def load_cloud_chip_data(url):
         with open(temp_file, "wb") as f:
             f.write(resp.content)
             
-        # 先全部讀取，不鎖死 columns，防止欄位名稱大小寫不一致報錯
+        # 先全部讀取，不鎖死 columns
         df_chip = pd.read_parquet(temp_file)
         
         if not df_chip.empty:
-            # 確保欄位名稱全部轉小寫，避開 Stock_ID 或 Name 等大小寫差異
+            # 確保欄位名稱全部轉小寫
             df_chip.columns = [str(c).lower() for c in df_chip.columns]
             
-            # 如果沒有這些基本欄位，提早回傳避免報錯
+            # 檢查基本欄位
             if not all(col in df_chip.columns for col in ['date', 'stock_id', 'name', 'buy', 'sell']):
                 st.error(f"⚠️ 欄位名稱錯誤！目前欄位：{df_chip.columns.tolist()}")
                 return df_chip
                 
-            # 🛠️ 核心修正 1：強制轉字串，清除所有隱形空白與 ".0" 小數點
+            # 清除所有隱形空白與 ".0" 小數點
             df_chip['stock_id'] = df_chip['stock_id'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
             df_chip['name'] = df_chip['name'].astype(str).str.strip()
             
-            # 🛠️ 核心修正 2：只保留外資 (先過濾再處理，加速後續運算)
-            df_chip = df_chip[df_chip['name'].str.contains('外資', na=False)].copy()
+            # 🛠️ 破案關鍵：改為搜尋 'Foreign_Investor' (也保留'外資'以防未來中文資料庫)
+            df_chip = df_chip[df_chip['name'].str.contains('Foreign_Investor|外資', case=False, na=False)].copy()
             
-            # 🛠️ 核心修正 3：確保日期格式絕對是 YYYY-MM-DD
+            # 確保日期格式絕對是 YYYY-MM-DD
             df_chip['date'] = pd.to_datetime(df_chip['date']).dt.strftime('%Y-%m-%d')
             
             # 預先算好買賣超，並捨棄不需要的欄位
