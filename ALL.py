@@ -119,7 +119,7 @@ def get_detailed_sector(code, standard_group=None, custom_db=None):
 
 PARQUET_PATH = "data/history.parquet"
 
-# 👇 籌碼資料庫 URL (保持你不變的網址)
+# 👇 籌碼資料庫 URL
 HF_CHIP_URL = "https://huggingface.co/datasets/4340P/institutional_investors_parquet_by_stock/resolve/main/all_institutional_investors_2020_2026.parquet"
 
 @st.cache_data(ttl=3600*12, show_spinner=False)
@@ -137,9 +137,18 @@ def load_cloud_chip_data(url):
         with open(temp_file, "wb") as f:
             f.write(resp.content)
             
-        df_chip = pd.read_parquet(temp_file, columns=['date', 'stock_id', 'name', 'buy', 'sell'])
+        # 先全部讀取，不鎖死 columns，防止欄位名稱大小寫不一致報錯
+        df_chip = pd.read_parquet(temp_file)
         
         if not df_chip.empty:
+            # 確保欄位名稱全部轉小寫，避開 Stock_ID 或 Name 等大小寫差異
+            df_chip.columns = [str(c).lower() for c in df_chip.columns]
+            
+            # 如果沒有這些基本欄位，提早回傳避免報錯
+            if not all(col in df_chip.columns for col in ['date', 'stock_id', 'name', 'buy', 'sell']):
+                st.error(f"⚠️ 欄位名稱錯誤！目前欄位：{df_chip.columns.tolist()}")
+                return df_chip
+                
             # 🛠️ 核心修正 1：強制轉字串，清除所有隱形空白與 ".0" 小數點
             df_chip['stock_id'] = df_chip['stock_id'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
             df_chip['name'] = df_chip['name'].astype(str).str.strip()
@@ -152,41 +161,9 @@ def load_cloud_chip_data(url):
             
             # 預先算好買賣超，並捨棄不需要的欄位
             df_chip['net_buy'] = ((df_chip['buy'] - df_chip['sell']) / 1000).astype('float32')
-            df_chip = df_chip.drop(columns=['buy', 'sell', 'name']) # 名字已經都是外資了，直接丟掉省記憶體
+            df_chip = df_chip[['date', 'stock_id', 'net_buy']]
             
         return df_chip
-        
-    except Exception as e:
-        st.error(f"❌ 讀取籌碼資料庫發生例外錯誤: {e}")
-        return pd.DataFrame()
-            
-        # 2. 將下載的資料寫入本地暫存檔
-        with open(temp_file, "wb") as f:
-            f.write(resp.content)
-            
-        # ==========================================
-        # 🚀 第一招修改區：極致瘦身讀取法
-        # ==========================================
-        # 3. 指定只讀取需要的 5 個欄位
-        df_chip = pd.read_parquet(temp_file, columns=['date', 'stock_id', 'name', 'buy', 'sell'])
-        
-        if not df_chip.empty:
-            # 秘訣 A：先把不要的法人剔除，只保留外資 (砍掉大量無用資料)
-            df_chip = df_chip[df_chip['name'].str.contains('外資')].copy()
-            
-            # 秘訣 B：把文字轉成 Category 類別，省下海量記憶體
-            df_chip['stock_id'] = df_chip['stock_id'].astype('category')
-            df_chip['name'] = df_chip['name'].astype('category')
-            
-            # 秘訣 C：日期轉字串，買賣超轉成佔用極小的 float32
-            df_chip['date'] = pd.to_datetime(df_chip['date']).dt.strftime('%Y-%m-%d')
-            df_chip['net_buy'] = ((df_chip['buy'] - df_chip['sell']) / 1000).astype('float32')
-            
-            # 秘訣 D：算完買賣超後，把原始超肥的 buy 和 sell 欄位直接丟垃圾桶
-            df_chip = df_chip.drop(columns=['buy', 'sell'])
-            
-        return df_chip
-        # ==========================================
         
     except Exception as e:
         st.error(f"❌ 讀取籌碼資料庫發生例外錯誤: {e}")
@@ -467,7 +444,7 @@ def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sect
         df = df.loc[~df.index.duplicated(keep='last')].copy()
         if pd.Timestamp(analysis_date_str) not in df.index: return f"無 {analysis_date_str} 交易資料"
         
-       # --- 🛡️ 籌碼濾網運算 ---
+        # --- 🛡️ 籌碼濾網運算 ---
         chip_summary = "無籌碼資料"
         passed_chip_filter = True 
         
@@ -476,11 +453,10 @@ def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sect
             lookback_days = params.get('c_lookback_days', 30)
             threshold_shares = params.get('c_threshold_shares', 10000)
             
-            # 取得該檔股票過去 N 天的實際交易日
             valid_dates = df[df.index <= target_date_ts].tail(lookback_days).index.strftime('%Y-%m-%d').tolist()
             
             if valid_dates:
-                # 🛠️ 核心修正 4：因為載入時已經只留外資了，這裡只需要單純比對「代號」與「日期」即可
+                # 單純比對代號與日期
                 mask = (df_chip_main['stock_id'] == code_str) & (df_chip_main['date'].isin(valid_dates))
                 recent_foreign_chip = df_chip_main[mask]
                 
@@ -493,14 +469,12 @@ def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sect
                     chip_summary = f"近{lookback_days}日無外資進出"
                     passed_chip_filter = False
         else:
-            # 如果沒有開過濾，單純抓取當天資料顯示
             if df_chip_main is not None and not df_chip_main.empty:
                  day_chip = df_chip_main[(df_chip_main['date'] == analysis_date_str) & (df_chip_main['stock_id'] == code_str)]
                  if not day_chip.empty:
                      foreign = day_chip['net_buy'].sum()
                      chip_summary = f"外資當日: {foreign:+.0f}張"
         
-        # 籌碼未達標，直接判出局
         if params.get('c_use_filter', True) and not passed_chip_filter:
             return {'sniper': None, 'day': None}
         # ------------------------------------------------
@@ -620,8 +594,7 @@ if start_scan:
     if c_use_filter or True: 
         status_text.text("☁️ 正在載入 Hugging Face 籌碼資料...")
         df_chip_main = load_cloud_chip_data(HF_CHIP_URL)
-        if not df_chip_main.empty:
-            # 💡 加入這行：確認籌碼庫是不是太舊了
+        if df_chip_main is not None and not df_chip_main.empty:
             st.sidebar.caption(f"✅ 雲端籌碼庫已載入 (資料最新至: **{df_chip_main['date'].max()}**)")
 
     sniper_triggered = []; sniper_setup = []; sniper_watching = []; day_candidates = []; failed_list = []
@@ -768,7 +741,7 @@ def plot_diagnosis_chart(df, stock_input, analysis_date_str, params, sniper_info
     
     try:
         df_chip = load_cloud_chip_data(HF_CHIP_URL)
-        stock_chip = df_chip[(df_chip['stock_id'] == str(stock_input).strip()) & (df_chip['name'].str.contains('外資'))].copy()
+        stock_chip = df_chip[(df_chip['stock_id'] == str(stock_input).strip())].copy() # 已經過濾外資
         if not stock_chip.empty:
             stock_chip.index = pd.to_datetime(stock_chip['date'])
             stock_chip = stock_chip.reindex(plot_df.index).fillna(0)
@@ -789,6 +762,35 @@ with tab5:
 
 with tab6:
     st.header("🔧 系統診斷")
+    
+    # --- 👇 新增：雲端籌碼資料庫檢測 ---
+    st.subheader("4. ☁️ 雲端籌碼資料庫檢測 (X 光機)")
+    if st.button("測試讀取雲端籌碼資料"):
+        with st.spinner("正在從 Hugging Face 下載並解析資料..."):
+            test_df = load_cloud_chip_data(HF_CHIP_URL)
+            if test_df is not None and not test_df.empty:
+                st.success("✅ 成功讀取籌碼資料庫！")
+                
+                c1, c2, c3 = st.columns(3)
+                c1.metric("總筆數 (僅限外資)", f"{len(test_df):,}")
+                c2.metric("涵蓋股票檔數", f"{test_df['stock_id'].nunique():,}")
+                c3.metric("資料最新日期", test_df['date'].max())
+                
+                st.write(f"📅 資料期間：{test_df['date'].min()} ~ {test_df['date'].max()}")
+                st.write("🔍 資料前 5 筆預覽：")
+                st.dataframe(test_df.head())
+                
+                # 測試特定股票是否能抓到
+                tsmc = test_df[test_df['stock_id'] == '2330']
+                if not tsmc.empty:
+                    st.info(f"✅ 成功找到台積電 (2330) 籌碼，最新一筆：{tsmc['date'].max()} / 外資淨買超：{tsmc['net_buy'].iloc[-1]:.0f} 張")
+                else:
+                    st.warning("⚠️ 在資料庫中找不到 2330 (台積電) 的資料，請確認股票代號格式是否異常。")
+            else:
+                st.error("❌ 無法讀取資料，或資料庫為空。請檢查上面的報錯訊息。")
+    st.divider()
+    # ------------------------------------
+
     st.subheader("1. 測試連線")
     if st.button("測試抓取 2330"):
         try:
