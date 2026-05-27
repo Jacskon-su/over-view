@@ -1,0 +1,40 @@
+# .github/workflows/update_chip.yml
+# GitHub Actions 每日自動更新法人籌碼資料並推送到 Hugging Face
+# 每天 21:37（台灣時間 UTC+8 = UTC 13:37）執行
+
+name: 🛡️ 每日更新法人籌碼資料
+
+on:
+  schedule:
+    # 調整為 UTC 13:37 (台灣時間 21:37)，且只在週一至週五 (1-5) 執行
+    - cron: '37 13 * * 1-5'
+  workflow_dispatch: # 保留手動觸發按鈕，方便除錯
+
+jobs:
+  update-chip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180 # 籌碼抓取可能需要較長時間，給予充分時間
+
+    steps:
+      # 1. 取得 Repo 程式碼
+      - name: ⬇️ Checkout Repo
+        uses: actions/checkout@v4
+
+      # 2. 設定 Python
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # 3. 安裝套件
+      - name: 📦 Install dependencies
+        run: |
+          pip install pandas requests huggingface_hub pyarrow
+
+      # 4. 執行籌碼更新腳本 (Token 透過 Secrets 安全注入)
+      - name: 🔄 Run update_chip.py
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+        run: python update_chip.py
