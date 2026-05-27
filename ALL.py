@@ -119,19 +119,18 @@ def get_detailed_sector(code, standard_group=None, custom_db=None):
 
 PARQUET_PATH = "data/history.parquet"
 
-# 👇 籌碼資料庫 URL (請替換為你的實際網址)
+# 👇 籌碼資料庫 URL (因為已經公開，所以不需要設定 Token 了)
 HF_CHIP_URL = "https://huggingface.co/datasets/4340P/institutional_investors_parquet_by_stock/resolve/main/all_institutional_investors_2020_2026.parquet"
 
 @st.cache_data(ttl=3600*12, show_spinner=False)
 def load_cloud_chip_data(url):
-    """載入雲端法人籌碼資料 (極致瘦身 + 安全兩段式下載版)"""
+    """載入雲端法人籌碼資料 (公開免 Token + 極致瘦身兩段式下載版)"""
     url = url.replace("/blob/main/", "/resolve/main/")
     temp_file = "temp_chip_data.parquet"
     
     try:
-        # 1. 使用 requests 安全下載檔案，避開 Pandas 網路底層 bug
-        headers = {'Authorization': f'Bearer {HF_TOKEN}'}
-        resp = requests.get(url, headers=headers, timeout=45) # 稍微延長超時時間到 45 秒
+        # 1. 使用 requests 安全下載檔案 (免帶 headers 授權)
+        resp = requests.get(url, timeout=45) 
         
         if resp.status_code != 200:
             st.error(f"❌ 雲端下載失敗，HTTP 狀態碼: {resp.status_code}")
@@ -144,11 +143,11 @@ def load_cloud_chip_data(url):
         # ==========================================
         # 🚀 第一招修改區：極致瘦身讀取法
         # ==========================================
-        # 3. 指定只讀取需要的 5 個欄位 (不讀取其他不相干的數據)
+        # 3. 指定只讀取需要的 5 個欄位
         df_chip = pd.read_parquet(temp_file, columns=['date', 'stock_id', 'name', 'buy', 'sell'])
         
         if not df_chip.empty:
-            # 秘訣 A：先把不要的法人剔除，只保留外資 (瞬間砍掉 2/3 的資料量)
+            # 秘訣 A：先把不要的法人剔除，只保留外資 (砍掉大量無用資料)
             df_chip = df_chip[df_chip['name'].str.contains('外資')].copy()
             
             # 秘訣 B：把文字轉成 Category 類別，省下海量記憶體
