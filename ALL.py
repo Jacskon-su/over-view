@@ -137,29 +137,22 @@ def load_cloud_chip_data(url):
         with open(temp_file, "wb") as f:
             f.write(resp.content)
             
-        # 先全部讀取，不鎖死 columns
         df_chip = pd.read_parquet(temp_file)
         
         if not df_chip.empty:
-            # 確保欄位名稱全部轉小寫
             df_chip.columns = [str(c).lower() for c in df_chip.columns]
             
-            # 檢查基本欄位
             if not all(col in df_chip.columns for col in ['date', 'stock_id', 'name', 'buy', 'sell']):
                 st.error(f"⚠️ 欄位名稱錯誤！目前欄位：{df_chip.columns.tolist()}")
                 return df_chip
                 
-            # 清除所有隱形空白與 ".0" 小數點
             df_chip['stock_id'] = df_chip['stock_id'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
             df_chip['name'] = df_chip['name'].astype(str).str.strip()
             
-            # 🛠️ 破案關鍵：改為搜尋 'Foreign_Investor' (也保留'外資'以防未來中文資料庫)
+            # 搜尋 'Foreign_Investor' 或是 '外資'
             df_chip = df_chip[df_chip['name'].str.contains('Foreign_Investor|外資', case=False, na=False)].copy()
             
-            # 確保日期格式絕對是 YYYY-MM-DD
             df_chip['date'] = pd.to_datetime(df_chip['date']).dt.strftime('%Y-%m-%d')
-            
-            # 預先算好買賣超，並捨棄不需要的欄位
             df_chip['net_buy'] = ((df_chip['buy'] - df_chip['sell']) / 1000).astype('float32')
             df_chip = df_chip[['date', 'stock_id', 'net_buy']]
             
@@ -168,6 +161,41 @@ def load_cloud_chip_data(url):
     except Exception as e:
         st.error(f"❌ 讀取籌碼資料庫發生例外錯誤: {e}")
         return pd.DataFrame()
+
+def evaluate_chip_filter(code_str, analysis_date_str, df_kline, chip_params, df_chip_main):
+    """共用的籌碼過濾器函數"""
+    chip_summary = "無籌碼資料"
+    passed_chip_filter = True 
+    
+    if chip_params.get('c_use_filter', True) and df_chip_main is not None and not df_chip_main.empty:
+        target_date_ts = pd.Timestamp(analysis_date_str)
+        lookback_days = chip_params.get('c_lookback_days', 30)
+        threshold_shares = chip_params.get('c_threshold_shares', 10000)
+        
+        # 取得該檔股票過去 N 天的實際交易日
+        valid_dates = df_kline[df_kline.index <= target_date_ts].tail(lookback_days).index.strftime('%Y-%m-%d').tolist()
+        
+        if valid_dates:
+            mask = (df_chip_main['stock_id'] == code_str) & (df_chip_main['date'].isin(valid_dates))
+            recent_foreign_chip = df_chip_main[mask]
+            
+            if not recent_foreign_chip.empty:
+                total_foreign_buy = recent_foreign_chip['net_buy'].sum()
+                chip_summary = f"近{lookback_days}日外資: {total_foreign_buy:+.0f}張"
+                if total_foreign_buy < threshold_shares:
+                    passed_chip_filter = False
+            else:
+                chip_summary = f"近{lookback_days}日無外資進出"
+                passed_chip_filter = False
+    else:
+        # 如果沒開過濾器，僅抓取當日資訊供參考
+        if df_chip_main is not None and not df_chip_main.empty:
+             day_chip = df_chip_main[(df_chip_main['date'] == analysis_date_str) & (df_chip_main['stock_id'] == code_str)]
+             if not day_chip.empty:
+                 foreign = day_chip['net_buy'].sum()
+                 chip_summary = f"外資當日: {foreign:+.0f}張"
+                 
+    return passed_chip_filter, chip_summary
 
 @st.cache_data(ttl=3600*12)
 def get_stock_info_map(_api_instance):
@@ -218,7 +246,7 @@ def get_stock_data_with_realtime(code, symbol, analysis_date_str, _api_instance)
     return df
 
 # ==========================================
-# 🐂 BULL_v7 模組
+# 🐂 BULL_v7 模組 (已整合籌碼過濾)
 # ==========================================
 BULL_SHEET_COLS = ["symbol","name","進場日期","進場價","上次加碼價","持倉最高價","加碼次數","加碼紀錄"]
 BULL_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -255,31 +283,38 @@ def bull_calc_indicators(df, params):
     df["SMA_Up"] = df["SMA"] > df["SMA"].shift(params["sma_trend_days"]); df["Vol_MA20"] = volume.rolling(params["vol_ma20_days"]).mean()
     df["Vol_Heavy"] = volume.rolling(params["vol_heavy_days"]).mean(); df["Vol_Shrink"] = volume.rolling(params["vol_shrink_days"]).mean()
     return df
-def bull_scan_one(code, info, df_raw, params, pos_map, scan_date_ts):
+
+def bull_scan_one(code, info, df_raw, params, pos_map, scan_date_ts, df_chip_main, chip_params):
     res = {"entry": None, "addon_a": None, "addon_b": None, "exit": None, "high_update": None}
     try:
+        # 🛡️ BULL 策略籌碼檢查
+        passed_chip, chip_summary = evaluate_chip_filter(str(code).strip(), scan_date_ts.strftime('%Y-%m-%d'), df_raw, chip_params, df_chip_main)
+        
         df = bull_calc_indicators(df_raw, params); df = df[df.index <= scan_date_ts]
         if len(df) < 50: return res
         sym = info["symbol"]; name = info["short_name"]; r = df.iloc[-1]; r1 = df.iloc[-2]
         c = float(r["Close"]); sma_i = float(r["SMA"]); lo_i = float(r["Lower"]); l_i = float(r["Low"]); vol_i = float(r["Volume"]); vheavy = float(r["Vol_Heavy"]) if not pd.isna(r["Vol_Heavy"]) else 0
         if sym not in pos_map:
-            if not (pd.isna(r["Squeeze_Recent"]) or pd.isna(r["Vol_MA20"])):
-                if bool(r["Squeeze_Recent"]) and bool(r["SMA_Up"]) and (c > float(r["Upper"])) and (vol_i > float(r["Vol_MA"]) * params["vol_ratio"]) and (float(r["Vol_MA20"]) > params["min_vol_shares"]):
-                    res["entry"] = {"代號": code, "名稱": name, "symbol": sym, "收盤價": round(c, 2), "上軌": round(float(r["Upper"]), 2), "15MA": round(sma_i, 2), "成交量": int(vol_i), "5MA量": int(r["Vol_MA"]) if not pd.isna(r["Vol_MA"]) else 0}
+            if passed_chip: # 僅在通過籌碼過濾時產生進場訊號
+                if not (pd.isna(r["Squeeze_Recent"]) or pd.isna(r["Vol_MA20"])):
+                    if bool(r["Squeeze_Recent"]) and bool(r["SMA_Up"]) and (c > float(r["Upper"])) and (vol_i > float(r["Vol_MA"]) * params["vol_ratio"]) and (float(r["Vol_MA20"]) > params["min_vol_shares"]):
+                        res["entry"] = {"代號": code, "名稱": name, "symbol": sym, "收盤價": round(c, 2), "上軌": round(float(r["Upper"]), 2), "15MA": round(sma_i, 2), "成交量": int(vol_i), "5MA量": int(r["Vol_MA"]) if not pd.isna(r["Vol_MA"]) else 0, "法人籌碼": chip_summary}
         else:
+            # 現有持倉不受進場籌碼濾網限制，仍須判斷加碼與出場
             pos = pos_map[sym]; ep = float(pos["進場價"]); lap = float(pos["上次加碼價"]); pp = float(pos["持倉最高價"])
             if c > pp: res["high_update"] = (sym, round(c, 2))
             heavy_break = (c < sma_i) and (vol_i >= vheavy) and vheavy > 0
             if heavy_break or (l_i <= lo_i):
-                res["exit"] = {"代號": code, "名稱": name, "symbol": sym, "收盤價": round(c, 2), "15MA": round(sma_i, 2), "進場價": round(ep, 2), "損益%": round((c - ep) / ep * 100, 2), "加碼次數": int(pos.get("加碼次數", 0)), "出場原因": "出量跌破15MA" if heavy_break else "最低碰下軌"}
+                res["exit"] = {"代號": code, "名稱": name, "symbol": sym, "收盤價": round(c, 2), "15MA": round(sma_i, 2), "進場價": round(ep, 2), "損益%": round((c - ep) / ep * 100, 2), "加碼次數": int(pos.get("加碼次數", 0)), "出場原因": "出量跌破15MA" if heavy_break else "最低碰下軌", "法人籌碼": chip_summary}
                 return res
             vshrink = float(r1["Vol_Shrink"]) if not pd.isna(r1["Vol_Shrink"]) else 0
-            if (float(r1["Close"]) < float(r1["SMA"])) and (float(r1["Volume"]) < vshrink if vshrink > 0 else False) and (c >= sma_i): res["addon_a"] = {"代號": code, "名稱": name, "symbol": sym, "收盤價": round(c, 2), "15MA": round(sma_i, 2), "加碼次數": int(pos.get("加碼次數", 0)), "加碼類型": "A 回測站回"}
+            if (float(r1["Close"]) < float(r1["SMA"])) and (float(r1["Volume"]) < vshrink if vshrink > 0 else False) and (c >= sma_i): res["addon_a"] = {"代號": code, "名稱": name, "symbol": sym, "收盤價": round(c, 2), "15MA": round(sma_i, 2), "加碼次數": int(pos.get("加碼次數", 0)), "加碼類型": "A 回測站回", "法人籌碼": chip_summary}
             profit = (c - lap) / lap if lap > 0 else 0
-            if c > pp and profit >= params["addon_b_profit"]: res["addon_b"] = {"代號": code, "名稱": name, "symbol": sym, "收盤價": round(c, 2), "持倉最高價": round(pp, 2), "距上次加碼": f"+{profit*100:.1f}%", "加碼次數": int(pos.get("加碼次數", 0)), "加碼類型": "B 突破新高"}
+            if c > pp and profit >= params["addon_b_profit"]: res["addon_b"] = {"代號": code, "名稱": name, "symbol": sym, "收盤價": round(c, 2), "持倉最高價": round(pp, 2), "距上次加碼": f"+{profit*100:.1f}%", "加碼次數": int(pos.get("加碼次數", 0)), "加碼類型": "B 突破新高", "法人籌碼": chip_summary}
     except: pass
     return res
-def bull_run_scan(stock_map, all_data, scan_date_str, bull_positions, bull_params, max_workers=16, status_text=None, progress_bar=None):
+
+def bull_run_scan(stock_map, all_data, scan_date_str, bull_positions, bull_params, max_workers=16, status_text=None, progress_bar=None, df_chip_main=None, chip_params=None):
     scan_date_ts = pd.Timestamp(scan_date_str); pos_map = {row["symbol"]: row for _, row in bull_positions.iterrows()} if len(bull_positions) > 0 else {}
     res = {"entry": [], "addon_a": [], "addon_b": [], "exit": [], "high_updates": []}
     valid_codes = {str(c): df for c, df in all_data.items() if str(c) in stock_map}
@@ -287,7 +322,7 @@ def bull_run_scan(stock_map, all_data, scan_date_str, bull_positions, bull_param
     if status_text: status_text.text(f"🐂 BULL_v7 策略運算中... (共 {total} 支)")
     if progress_bar: progress_bar.progress(0)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(bull_scan_one, code, stock_map[code], df, bull_params, pos_map, scan_date_ts): code for code, df in valid_codes.items()}
+        futures = {executor.submit(bull_scan_one, code, stock_map[code], df, bull_params, pos_map, scan_date_ts, df_chip_main, chip_params): code for code, df in valid_codes.items()}
         for future in concurrent.futures.as_completed(futures):
             done += 1
             if done % 100 == 0 or done == total:
@@ -386,7 +421,7 @@ def fetch_realtime_batch(codes_list, _api_instance, status_text=None):
     return realtime_data
 
 # ==========================================
-# 📈 策略模組 + 籌碼與處置股過濾
+# 📈 策略模組 + 籌碼與過濾
 # ==========================================
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_market_status(analysis_date_str, _api_instance=None):
@@ -409,35 +444,9 @@ def fetch_market_status(analysis_date_str, _api_instance=None):
         return {'strong': score >= 7, 'score': score, 'label': "🟢 大盤強勢" if score >= 7 else ("🟡 大盤偏弱" if score >= 4 else "🔴 大盤弱勢"), 'close': round(c, 0), 'ma20': round(m20, 0), 'ma60': round(m60, 0)}
     except: return {'strong': True, 'score': 5, 'label': '大盤資料異常', 'close': '-', 'ma20': '-', 'ma60': '-'}
 
-def calc_sniper_score(c_today, prev_h, defense_price, s_high, s_low, s_close, setup_idx, idx, high, low, volume, op, market_score, pullback_depth=0):
-    score = 0; details = {}
-    risk_pct = (c_today - defense_price) / c_today * 100 if c_today > 0 else 0; details['風險距離'] = round(risk_pct, 1)
-    if risk_pct <= 3.0: score += 35
-    elif risk_pct <= 5.0: score += 25
-    elif risk_pct <= 8.0: score += 15
-    vol_ratio = volume.iloc[idx] / volume.iloc[setup_idx:idx].mean() if setup_idx > 0 and idx > setup_idx and volume.iloc[setup_idx:idx].mean() > 0 else 0; details['量能倍數'] = round(vol_ratio, 1)
-    if 2.0 <= vol_ratio <= 4.0: score += 25
-    elif 1.5 <= vol_ratio < 2.0: score += 18
-    elif vol_ratio >= 4.0: score += 12
-    elif vol_ratio >= 1.0: score += 8
-    close_strength = (c_today - low.iloc[idx]) / (high.iloc[idx] - low.iloc[idx]) if (high.iloc[idx] - low.iloc[idx]) > 0 else 0; details['收盤強度'] = round(close_strength, 2)
-    if close_strength >= 0.85: score += 20
-    elif close_strength >= 0.70: score += 14
-    elif close_strength >= 0.50: score += 7
-    details['回測深度'] = round(pullback_depth, 1)
-    if pullback_depth <= 20: score += 10
-    elif pullback_depth <= 38: score += 7
-    elif pullback_depth <= 50: score += 3
-    score += round(market_score / 10 * 5)
-    return min(score, 100), details
-
 def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sector_db, pre_loaded_df=None, market_score=5, df_chip_main=None):
     try:
         code_str = str(code).strip()
-        
-        # 🚫 處置股/手動排除名單過濾
-        if code_str in params.get('exclude_list', []):
-            return {'sniper': None, 'day': None}
 
         df = pre_loaded_df.copy() if pre_loaded_df is not None else get_stock_data_with_realtime(code, info['symbol'], analysis_date_str, api)
         if df is None or df.empty or len(df) < 200: return "資料長度不足 (<200天)"
@@ -445,35 +454,7 @@ def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sect
         if pd.Timestamp(analysis_date_str) not in df.index: return f"無 {analysis_date_str} 交易資料"
         
         # --- 🛡️ 籌碼濾網運算 ---
-        chip_summary = "無籌碼資料"
-        passed_chip_filter = True 
-        
-        if params.get('c_use_filter', True) and df_chip_main is not None and not df_chip_main.empty:
-            target_date_ts = pd.Timestamp(analysis_date_str)
-            lookback_days = params.get('c_lookback_days', 30)
-            threshold_shares = params.get('c_threshold_shares', 10000)
-            
-            valid_dates = df[df.index <= target_date_ts].tail(lookback_days).index.strftime('%Y-%m-%d').tolist()
-            
-            if valid_dates:
-                # 單純比對代號與日期
-                mask = (df_chip_main['stock_id'] == code_str) & (df_chip_main['date'].isin(valid_dates))
-                recent_foreign_chip = df_chip_main[mask]
-                
-                if not recent_foreign_chip.empty:
-                    total_foreign_buy = recent_foreign_chip['net_buy'].sum()
-                    chip_summary = f"近{lookback_days}日外資: {total_foreign_buy:+.0f}張"
-                    if total_foreign_buy < threshold_shares:
-                        passed_chip_filter = False
-                else:
-                    chip_summary = f"近{lookback_days}日無外資進出"
-                    passed_chip_filter = False
-        else:
-            if df_chip_main is not None and not df_chip_main.empty:
-                 day_chip = df_chip_main[(df_chip_main['date'] == analysis_date_str) & (df_chip_main['stock_id'] == code_str)]
-                 if not day_chip.empty:
-                     foreign = day_chip['net_buy'].sum()
-                     chip_summary = f"外資當日: {foreign:+.0f}張"
+        passed_chip_filter, chip_summary = evaluate_chip_filter(code_str, analysis_date_str, df, params, df_chip_main)
         
         if params.get('c_use_filter', True) and not passed_chip_filter:
             return {'sniper': None, 'day': None}
@@ -505,12 +486,10 @@ def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sect
                     is_breakout = c_today > prev_h; is_gap_breakout = (op.iloc[idx] > high.iloc[idx-1]) and (close.iloc[idx] > op.iloc[idx])
                     if not dropped_below_high:
                         if (c_today - s_close) / s_close <= 0.10:
-                            score, score_details = calc_sniper_score(c_today, prev_h, defense_price, s_high, s_low, s_close, setup_idx, idx, high, low, volume, op, market_score, pullback_depth)
-                            result_sniper = ("triggered", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "漲幅": f"{daily_pct:+.2f}%", "產業": sector_name, "狀態": "🚀 強勢突破", "訊號日": s_date, "突破價": f"{prev_h:.2f}", "防守價": f"{defense_price:.2f}", "法人籌碼": chip_summary, "風險距離": f"{'✅' if score_details.get('風險距離',0)<=5.0 else '⚠️'}{score_details.get('風險距離',0):.1f}%", "回測深度": f"{'🔒' if score_details.get('回測深度',0)<=38 else '📊'}{score_details.get('回測深度',0):.1f}%", "sort_pct": daily_pct, "_score": score, "_risk_pct": score_details.get('風險距離',0), "_setup_date": s_date, "_defense": defense_price, "_signal_high": s_high, "_signal_low": s_low}) if is_breakout else ("watching", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "漲幅": f"{daily_pct:+.2f}%", "產業": sector_name, "狀態": "💪 強勢整理", "訊號日": s_date, "防守": f"{defense_price:.2f}", "法人籌碼": chip_summary, "長紅高": f"{s_high:.2f}", "sort_pct": daily_pct, "_setup_date": s_date, "_defense": defense_price, "_signal_high": s_high, "_signal_low": s_low})
+                            result_sniper = ("triggered", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "漲幅": f"{daily_pct:+.2f}%", "產業": sector_name, "狀態": "🚀 強勢突破", "訊號日": s_date, "突破價": f"{prev_h:.2f}", "防守價": f"{defense_price:.2f}", "法人籌碼": chip_summary, "sort_pct": daily_pct, "_setup_date": s_date, "_defense": defense_price, "_signal_high": s_high, "_signal_low": s_low}) if is_breakout else ("watching", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "漲幅": f"{daily_pct:+.2f}%", "產業": sector_name, "狀態": "💪 強勢整理", "訊號日": s_date, "防守": f"{defense_price:.2f}", "法人籌碼": chip_summary, "長紅高": f"{s_high:.2f}", "sort_pct": daily_pct, "_setup_date": s_date, "_defense": defense_price, "_signal_high": s_high, "_signal_low": s_low})
                     else:
                         if (is_breakout and close.iloc[idx-1] <= (s_high * 1.02)) or is_gap_breakout:
-                            score, score_details = calc_sniper_score(c_today, prev_h, defense_price, s_high, s_low, s_close, setup_idx, idx, high, low, volume, op, market_score, pullback_depth)
-                            result_sniper = ("triggered", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "漲幅": f"{daily_pct:+.2f}%", "產業": sector_name, "狀態": "🚀 N字跳空" if is_gap_breakout else "🎯 N字突破", "訊號日": s_date, "突破價": f"{prev_h:.2f}", "防守價": f"{defense_price:.2f}", "法人籌碼": chip_summary, "風險距離": f"{'✅' if score_details.get('風險距離',0)<=5.0 else '⚠️'}{score_details.get('風險距離',0):.1f}%", "回測深度": f"{'🔒' if score_details.get('回測深度',0)<=38 else '📊'}{score_details.get('回測深度',0):.1f}%", "sort_pct": daily_pct, "_score": score, "_risk_pct": score_details.get('風險距離',0), "_setup_date": s_date, "_defense": defense_price, "_signal_high": s_high, "_signal_low": s_low})
+                            result_sniper = ("triggered", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "漲幅": f"{daily_pct:+.2f}%", "產業": sector_name, "狀態": "🚀 N字跳空" if is_gap_breakout else "🎯 N字突破", "訊號日": s_date, "突破價": f"{prev_h:.2f}", "防守價": f"{defense_price:.2f}", "法人籌碼": chip_summary, "sort_pct": daily_pct, "_setup_date": s_date, "_defense": defense_price, "_signal_high": s_high, "_signal_low": s_low})
                         else: result_sniper = ("watching", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "漲幅": f"{daily_pct:+.2f}%", "產業": sector_name, "狀態": "📉 回檔整理", "訊號日": s_date, "防守": f"{defense_price:.2f}", "法人籌碼": chip_summary, "長紅高": f"{s_high:.2f}", "sort_pct": daily_pct, "_setup_date": s_date, "_defense": defense_price, "_signal_high": s_high, "_signal_low": s_low})
             elif is_setup:
                 result_sniper = ("new_setup", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "產業": sector_name, "狀態": "🔥 剛起漲", "漲幅": f"{daily_pct:+.2f}%", "法人籌碼": chip_summary, "sort_pct": daily_pct, "_setup_date": df.index[idx].strftime('%Y-%m-%d'), "_defense": defense_price, "_signal_high": high.iloc[idx], "_signal_low": low.iloc[idx]})
@@ -543,14 +522,8 @@ status_text = st.sidebar.empty()
 progress_bar = st.sidebar.progress(0)
 st.sidebar.divider()
 
-# 👇 處置股 / 排除名單過濾器
-with st.sidebar.expander("🚫 排除名單 (處置股過濾)", expanded=True):
-    exclude_stocks_input = st.text_area("輸入要排除的股票代號 (用半形逗號分隔)", value="")
-    exclude_list = [x.strip() for x in exclude_stocks_input.split(",") if x.strip()]
-    st.caption(f"目前已設定排除 {len(exclude_list)} 檔股票")
-
-# 👇 籌碼過濾器 UI 區塊 (預設改為 True)
-with st.sidebar.expander("🛡️ 法人籌碼濾網", expanded=True):
+# 👇 法人過濾預設改為收起 (expanded=False)
+with st.sidebar.expander("🛡️ 法人籌碼濾網", expanded=False):
     c_use_filter = st.checkbox("啟用籌碼過濾 (僅篩選外資買超)", value=True)
     st.caption("啟用後，未達標股票將不會顯示在結果中")
     c_lookback_days = st.number_input("最近 N 天", min_value=1, max_value=250, value=30)
@@ -565,8 +538,9 @@ with st.sidebar.expander("⚡ 隔日沖雷達參數", expanded=False):
 max_workers_input = st.sidebar.slider("運算效能(執行緒)", 1, 32, 16)
 
 # 組合所有參數
-params = {'exclude_list': exclude_list, 'c_use_filter': c_use_filter, 'c_lookback_days': c_lookback_days, 'c_threshold_shares': c_threshold_shares, 's_ma_trend': s_ma_trend, 's_use_year': s_use_year, 's_big_candle': s_big_candle, 's_min_vol': s_min_vol, 's_setup_lookback': s_setup_lookback, 's_vol_ma_days': s_vol_ma_days, 's_vol_ratio': s_vol_ratio, 's_pullback_max': s_pullback_max, 'd_period': d_period, 'd_threshold': d_threshold, 'd_min_pct': d_min_pct, 'd_min_vol': d_min_vol}
+params = {'c_use_filter': c_use_filter, 'c_lookback_days': c_lookback_days, 'c_threshold_shares': c_threshold_shares, 's_ma_trend': s_ma_trend, 's_use_year': s_use_year, 's_big_candle': s_big_candle, 's_min_vol': s_min_vol, 's_setup_lookback': s_setup_lookback, 's_vol_ma_days': s_vol_ma_days, 's_vol_ratio': s_vol_ratio, 's_pullback_max': s_pullback_max, 'd_period': d_period, 'd_threshold': d_threshold, 'd_min_pct': d_min_pct, 'd_min_vol': d_min_vol}
 bull_params = {**BULL_PARAMS, "boll_period": int(b_boll_period), "boll_std": float(b_boll_std), "squeeze_n": int(b_squeeze_n), "squeeze_lookback": int(b_squeeze_lb), "vol_ratio": float(b_vol_ratio), "sma_trend_days": int(b_sma_days), "min_vol_shares": int(b_min_vol), "addon_b_profit": float(b_addon_b_pct)}
+chip_params = {'c_use_filter': c_use_filter, 'c_lookback_days': c_lookback_days, 'c_threshold_shares': c_threshold_shares}
 
 tab1, tab3, tab4, tab5, tab6 = st.tabs(["🟢 狙擊手波段", "🐂 BULL滾雪球", "⚡ 隔日沖雷達", "📊 個股診斷", "🔧 系統診斷"])
 
@@ -661,12 +635,12 @@ if start_scan:
 
     st.session_state['scan_results'] = {'sniper_triggered': sniper_triggered, 'sniper_setup': sniper_setup, 'sniper_watching': sniper_watching, 'day_candidates': day_candidates, 'failed_list': failed_list}
     progress_bar.progress(1.0)
-    status_text.success("✅ 全域掃描（含籌碼與排除名單濾網）已完成！")
+    status_text.success("✅ 全域掃描（含籌碼濾網）已完成！")
     st.session_state['scan_params'] = params.copy()
     st.session_state['scan_date'] = analysis_date_str
     
     try:
-        st.session_state['bull_results'] = bull_run_scan(stock_map=st.session_state['stock_map_cache'], all_data=st.session_state['all_data_cache'], scan_date_str=analysis_date_str, bull_positions=st.session_state['bull_positions'], bull_params=bull_params, max_workers=max_workers_input, status_text=status_text, progress_bar=progress_bar)
+        st.session_state['bull_results'] = bull_run_scan(stock_map=st.session_state['stock_map_cache'], all_data=st.session_state['all_data_cache'], scan_date_str=analysis_date_str, bull_positions=st.session_state['bull_positions'], bull_params=bull_params, max_workers=max_workers_input, status_text=status_text, progress_bar=progress_bar, df_chip_main=df_chip_main, chip_params=chip_params)
     except Exception as e: logger.error(f"BULL 錯誤: {e}")
 
 results = st.session_state['scan_results']
@@ -685,8 +659,8 @@ with tab1:
             with st.expander(f"⚠️ 掃描失敗清單 ({len(results['failed_list'])})"): st.write(", ".join(results['failed_list']))
         s_trig = results['sniper_triggered']; trig_strong = [x for x in s_trig if "強勢突破" in x['狀態']]; trig_n = [x for x in s_trig if "N字" in x['狀態']]
         if trig_strong or trig_n:
-            if trig_strong: st.markdown(f"#### 🚀 強勢突破 ({len(trig_strong)})"); display_full_table(pd.DataFrame(trig_strong).sort_values(by='sort_pct', ascending=False).drop(columns=[c for c in ['sort_pct', '_score', '_risk_pct'] if c in pd.DataFrame(trig_strong).columns]))
-            if trig_n: st.markdown(f"#### 🎯 N字突破 ({len(trig_n)})"); display_full_table(pd.DataFrame(trig_n).sort_values(by='sort_pct', ascending=False).drop(columns=[c for c in ['sort_pct', '_score', '_risk_pct'] if c in pd.DataFrame(trig_n).columns]))
+            if trig_strong: st.markdown(f"#### 🚀 強勢突破 ({len(trig_strong)})"); display_full_table(pd.DataFrame(trig_strong).sort_values(by='sort_pct', ascending=False).drop(columns=[c for c in ['sort_pct', '_setup_date', '_defense', '_signal_high', '_signal_low'] if c in pd.DataFrame(trig_strong).columns]))
+            if trig_n: st.markdown(f"#### 🎯 N字突破 ({len(trig_n)})"); display_full_table(pd.DataFrame(trig_n).sort_values(by='sort_pct', ascending=False).drop(columns=[c for c in ['sort_pct', '_setup_date', '_defense', '_signal_high', '_signal_low'] if c in pd.DataFrame(trig_n).columns]))
     else: st.info("👈 請點擊左側「開始全域掃描」")
 
 with tab3:
@@ -741,7 +715,7 @@ def plot_diagnosis_chart(df, stock_input, analysis_date_str, params, sniper_info
     
     try:
         df_chip = load_cloud_chip_data(HF_CHIP_URL)
-        stock_chip = df_chip[(df_chip['stock_id'] == str(stock_input).strip())].copy() # 已經過濾外資
+        stock_chip = df_chip[(df_chip['stock_id'] == str(stock_input).strip())].copy()
         if not stock_chip.empty:
             stock_chip.index = pd.to_datetime(stock_chip['date'])
             stock_chip = stock_chip.reindex(plot_df.index).fillna(0)
@@ -763,34 +737,6 @@ with tab5:
 with tab6:
     st.header("🔧 系統診斷")
     
-    # --- 👇 新增：雲端籌碼資料庫檢測 ---
-    st.subheader("4. ☁️ 雲端籌碼資料庫檢測 (X 光機)")
-    if st.button("測試讀取雲端籌碼資料"):
-        with st.spinner("正在從 Hugging Face 下載並解析資料..."):
-            test_df = load_cloud_chip_data(HF_CHIP_URL)
-            if test_df is not None and not test_df.empty:
-                st.success("✅ 成功讀取籌碼資料庫！")
-                
-                c1, c2, c3 = st.columns(3)
-                c1.metric("總筆數 (僅限外資)", f"{len(test_df):,}")
-                c2.metric("涵蓋股票檔數", f"{test_df['stock_id'].nunique():,}")
-                c3.metric("資料最新日期", test_df['date'].max())
-                
-                st.write(f"📅 資料期間：{test_df['date'].min()} ~ {test_df['date'].max()}")
-                st.write("🔍 資料前 5 筆預覽：")
-                st.dataframe(test_df.head())
-                
-                # 測試特定股票是否能抓到
-                tsmc = test_df[test_df['stock_id'] == '2330']
-                if not tsmc.empty:
-                    st.info(f"✅ 成功找到台積電 (2330) 籌碼，最新一筆：{tsmc['date'].max()} / 外資淨買超：{tsmc['net_buy'].iloc[-1]:.0f} 張")
-                else:
-                    st.warning("⚠️ 在資料庫中找不到 2330 (台積電) 的資料，請確認股票代號格式是否異常。")
-            else:
-                st.error("❌ 無法讀取資料，或資料庫為空。請檢查上面的報錯訊息。")
-    st.divider()
-    # ------------------------------------
-
     st.subheader("1. 測試連線")
     if st.button("測試抓取 2330"):
         try:
@@ -836,3 +782,30 @@ with tab6:
             st.info(f"📦 檔案大小：{file_size_mb:.1f} MB　|　股票數量：{total_stocks} 支")
         except Exception as e:
             st.error(f"❌ 資料檢查失敗：{e}")
+
+    st.divider()
+    # --- 移至最下方的雲端籌碼檢測 ---
+    st.subheader("4. ☁️ 雲端籌碼資料庫檢測 (X 光機)")
+    if st.button("測試讀取雲端籌碼資料"):
+        with st.spinner("正在從 Hugging Face 下載並解析資料..."):
+            test_df = load_cloud_chip_data(HF_CHIP_URL)
+            if test_df is not None and not test_df.empty:
+                st.success("✅ 成功讀取籌碼資料庫！")
+                
+                c1, c2, c3 = st.columns(3)
+                c1.metric("總筆數 (僅限外資)", f"{len(test_df):,}")
+                c2.metric("涵蓋股票檔數", f"{test_df['stock_id'].nunique():,}")
+                c3.metric("資料最新日期", test_df['date'].max())
+                
+                st.write(f"📅 資料期間：{test_df['date'].min()} ~ {test_df['date'].max()}")
+                st.write("🔍 資料前 5 筆預覽：")
+                st.dataframe(test_df.head())
+                
+                # 測試特定股票是否能抓到
+                tsmc = test_df[test_df['stock_id'] == '2330']
+                if not tsmc.empty:
+                    st.info(f"✅ 成功找到台積電 (2330) 籌碼，最新一筆：{tsmc['date'].max()} / 外資淨買超：{tsmc['net_buy'].iloc[-1]:.0f} 張")
+                else:
+                    st.warning("⚠️ 在資料庫中找不到 2330 (台積電) 的資料，請確認股票代號格式是否異常。")
+            else:
+                st.error("❌ 無法讀取資料，或資料庫為空。請檢查上面的報錯訊息。")
