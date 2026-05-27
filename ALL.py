@@ -124,18 +124,49 @@ HF_CHIP_URL = "https://huggingface.co/datasets/4340P/institutional_investors_par
 
 @st.cache_data(ttl=3600*12, show_spinner=False)
 def load_cloud_chip_data(url):
-    """載入雲端法人籌碼資料"""
-    # 自動防呆：將錯誤的網頁預覽路徑(blob)轉換為直接下載路徑(resolve)
+    """載入雲端法人籌碼資料 (極致瘦身 + 安全兩段式下載版)"""
     url = url.replace("/blob/main/", "/resolve/main/")
+    temp_file = "temp_chip_data.parquet"
+    
     try:
-        df_chip = pd.read_parquet(url)
+        # 1. 使用 requests 安全下載檔案，避開 Pandas 網路底層 bug
+        headers = {'Authorization': f'Bearer {HF_TOKEN}'}
+        resp = requests.get(url, headers=headers, timeout=45) # 稍微延長超時時間到 45 秒
+        
+        if resp.status_code != 200:
+            st.error(f"❌ 雲端下載失敗，HTTP 狀態碼: {resp.status_code}")
+            return pd.DataFrame()
+            
+        # 2. 將下載的資料寫入本地暫存檔
+        with open(temp_file, "wb") as f:
+            f.write(resp.content)
+            
+        # ==========================================
+        # 🚀 第一招修改區：極致瘦身讀取法
+        # ==========================================
+        # 3. 指定只讀取需要的 5 個欄位 (不讀取其他不相干的數據)
+        df_chip = pd.read_parquet(temp_file, columns=['date', 'stock_id', 'name', 'buy', 'sell'])
+        
         if not df_chip.empty:
+            # 秘訣 A：先把不要的法人剔除，只保留外資 (瞬間砍掉 2/3 的資料量)
+            df_chip = df_chip[df_chip['name'].str.contains('外資')].copy()
+            
+            # 秘訣 B：把文字轉成 Category 類別，省下海量記憶體
+            df_chip['stock_id'] = df_chip['stock_id'].astype('category')
+            df_chip['name'] = df_chip['name'].astype('category')
+            
+            # 秘訣 C：日期轉字串，買賣超轉成佔用極小的 float32
             df_chip['date'] = pd.to_datetime(df_chip['date']).dt.strftime('%Y-%m-%d')
-            df_chip['stock_id'] = df_chip['stock_id'].astype(str).str.strip()
-            df_chip['net_buy'] = (df_chip['buy'] - df_chip['sell']) / 1000 # 預先計算買賣超(張)
+            df_chip['net_buy'] = ((df_chip['buy'] - df_chip['sell']) / 1000).astype('float32')
+            
+            # 秘訣 D：算完買賣超後，把原始超肥的 buy 和 sell 欄位直接丟垃圾桶
+            df_chip = df_chip.drop(columns=['buy', 'sell'])
+            
         return df_chip
+        # ==========================================
+        
     except Exception as e:
-        st.error(f"❌ 讀取籌碼資料庫失敗。請點擊右上角「Clear Cache」後重試。錯誤: {e}")
+        st.error(f"❌ 讀取籌碼資料庫發生例外錯誤: {e}")
         return pd.DataFrame()
 
 @st.cache_data(ttl=3600*12)
