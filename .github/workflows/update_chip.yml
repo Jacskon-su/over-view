@@ -1,9 +1,35 @@
-- name: 🔍 Debug Secrets & Run
+name: 🛡️ 每日更新法人籌碼資料
+
+on:
+  schedule:
+    - cron: '37 13 * * 1-5'
+  workflow_dispatch: 
+
+jobs:
+  update-chip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180 
+
+    steps:
+      - name: ⬇️ Checkout Repo
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: 📦 Install dependencies
+        run: pip install pandas requests huggingface_hub pyarrow
+
+      - name: 🔍 Debug Secrets & Run
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
         run: |
           if [ -z "$HF_TOKEN" ]; then
-            echo "🚨 抓到兇手了！GitHub Secrets 傳出來的密碼是空的！請檢查設定頁面！"
+            echo "🚨 抓到兇手了！GitHub Secrets 傳出來的密碼是空的！請檢查 Repository secrets 設定頁面！"
           else
             echo "✅ 機器人有拿到密碼了，準備交給 Python！"
           fi
