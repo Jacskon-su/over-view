@@ -1,12 +1,11 @@
 # ==========================================
-# 強勢股戰情室 V18 (精準除錯版)
+# 強勢股戰情室 V18 (精準除錯版) + ☁️ 雲端籌碼整合版
 # V2~V16: 歷史更新與 Bug 修正
 # V17_beta: 新增「🔧 系統診斷」分頁
-# V18: 🚀 終極進化版
-#      - (核心修復) 徹底放棄 list(TSE) 迭代，改由 Parquet 提取代號進行「精準點名」，
-#        完美避開永豐金資料庫 int 型態建檔錯誤導致的崩潰截斷與 600 筆快取問題。
-#      - (還原設定) 預設改回 simulation=True，符合一般 API 使用者權限。
-#      - (優化) Shioaji 兩階段快照補考，解決漏封包問題。
+# V18: 🚀 終極進化版 + 籌碼濾網
+#      - (核心修復) 徹底放棄 list(TSE) 迭代，改由 Parquet 提取代號進行「精準點名」。
+#      - (籌碼整合) 加入 Hugging Face 歷史法人資料庫。
+#      - (新增濾網) 側邊欄新增「近X日外資買超Y張」過濾條件，技術面與籌碼面雙劍合璧！
 # ==========================================
 import streamlit as st
 import os
@@ -49,7 +48,7 @@ warnings.filterwarnings("ignore")
 # ==========================================
 # ⚙️ 頁面設定
 # ==========================================
-st.set_page_config(page_title="強勢股戰情室 V18", page_icon="🔥", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="強勢股戰情室 V18+", page_icon="🔥", layout="wide", initial_sidebar_state="expanded")
 
 import pytz as _pytz_main
 _TW_TZ = _pytz_main.timezone("Asia/Taipei")
@@ -73,7 +72,6 @@ def get_shioaji_api():
     if "shioaji" not in st.secrets:
         st.error("❌ 找不到永豐金 API 金鑰！")
         st.stop()
-    # 預設使用模擬環境，避免 Token 權限不足的問題
     is_sim = st.secrets["shioaji"].get("simulation", True)
     api = sj.Shioaji(simulation=is_sim)
     try:
@@ -85,7 +83,7 @@ def get_shioaji_api():
 api = get_shioaji_api()
 
 # ==========================================
-# 🧠 策略核心邏輯類別
+# 🧠 策略核心邏輯類別 (Backtesting 備用)
 # ==========================================
 def SMA(array, n): return pd.Series(array).rolling(window=n).mean()
 
@@ -127,28 +125,36 @@ def get_detailed_sector(code, standard_group=None, custom_db=None):
 
 PARQUET_PATH = "data/history.parquet"
 
+# 👇 籌碼資料庫 URL (請替換為你的實際網址)
+HF_CHIP_URL = "https://huggingface.co/datasets/請替換為你的帳號/請替換為你的資料集名稱/resolve/main/all_institutional_investors_2020_2026.parquet"
+
+@st.cache_data(ttl=3600*12, show_spinner=False)
+def load_cloud_chip_data(url):
+    """載入雲端法人籌碼資料"""
+    try:
+        df_chip = pd.read_parquet(url)
+        if not df_chip.empty:
+            df_chip['date'] = pd.to_datetime(df_chip['date']).dt.strftime('%Y-%m-%d')
+            df_chip['stock_id'] = df_chip['stock_id'].astype(str).str.strip()
+            df_chip['net_buy'] = (df_chip['buy'] - df_chip['sell']) / 1000 # 預先計算買賣超(張)
+        return df_chip
+    except Exception as e:
+        st.error(f"❌ 讀取籌碼資料庫失敗，請確認網址是否正確。錯誤訊息: {e}")
+        return pd.DataFrame()
+
 @st.cache_data(ttl=3600*12)
 def get_stock_info_map(_api_instance):
-    """
-    🛠️ 終極防護：放棄 api.Contracts.Stocks.TSE 迭代器！
-    改由 history.parquet 提取股票代號，進行安全點名，徹底避開 int 崩潰地雷。
-    """
     stock_map = {}
     valid_codes = set()
-    
-    # 1. 優先從 Parquet 讀取代號 (保證能拿到你原本完整的 1959 檔)
     if os.path.exists(PARQUET_PATH):
         try:
             df = pd.read_parquet(PARQUET_PATH, columns=["code"])
             valid_codes.update(df["code"].astype(str).unique())
         except: pass
-
-    # 2. 如果 Parquet 剛好沒東西，盲掃台股四碼 + 00 開頭的 ETF 作為備用
     if len(valid_codes) < 1000:
         valid_codes.update([str(i).zfill(4) for i in range(1101, 10000)])
         valid_codes.update([f"00{str(i).zfill(3)}" for i in range(1, 1000)])
 
-    # 3. 逐一點名，保證傳入的是乾淨的字串，避開毒封包
     for c_str in valid_codes:
         c_str = c_str.strip()
         if len(c_str) < 4: continue
@@ -353,7 +359,7 @@ def fetch_realtime_batch(codes_list, _api_instance, status_text=None):
     return realtime_data
 
 # ==========================================
-# 📈 策略模組
+# 📈 策略模組 + 籌碼計算
 # ==========================================
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_market_status(analysis_date_str, _api_instance=None):
@@ -398,18 +404,66 @@ def calc_sniper_score(c_today, prev_h, defense_price, s_high, s_low, s_close, se
     score += round(market_score / 10 * 5)
     return min(score, 100), details
 
-def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sector_db, pre_loaded_df=None, market_score=5):
+# 👇 修改函數：加入 df_chip_main 與籌碼過濾參數
+def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sector_db, pre_loaded_df=None, market_score=5, df_chip_main=None):
     try:
+        code_str = str(code).strip()
         df = pre_loaded_df.copy() if pre_loaded_df is not None else get_stock_data_with_realtime(code, info['symbol'], analysis_date_str, api)
         if df is None or df.empty or len(df) < 200: return "資料長度不足 (<200天)"
         df = df.loc[~df.index.duplicated(keep='last')].copy()
         if pd.Timestamp(analysis_date_str) not in df.index: return f"無 {analysis_date_str} 交易資料"
+        
+        # --- 👇 籌碼濾網運算 ---
+        chip_summary = "無籌碼資料"
+        passed_chip_filter = True # 預設通過
+        
+        if params.get('c_use_filter', False) and df_chip_main is not None and not df_chip_main.empty:
+            target_date_ts = pd.Timestamp(analysis_date_str)
+            lookback_days = params.get('c_lookback_days', 30)
+            threshold_shares = params.get('c_threshold_shares', 10000)
+            
+            # 取得該檔股票過去 N 天的交易日 (利用現有的 K 線 df 索引)
+            valid_dates = df[df.index <= target_date_ts].tail(lookback_days).index.strftime('%Y-%m-%d').tolist()
+            
+            if valid_dates:
+                # 篩選出這檔股票、在這段期間、且為外資的資料
+                mask = (df_chip_main['stock_id'] == code_str) & \
+                       (df_chip_main['date'].isin(valid_dates)) & \
+                       (df_chip_main['name'].str.contains('外資', na=False))
+                
+                recent_foreign_chip = df_chip_main[mask]
+                
+                if not recent_foreign_chip.empty:
+                    # 計算這 X 天內的外資累計買賣超 (張數)
+                    total_foreign_buy = recent_foreign_chip['net_buy'].sum()
+                    chip_summary = f"近{lookback_days}日外資累計: {total_foreign_buy:+.0f}張"
+                    
+                    # 判斷是否達標
+                    if total_foreign_buy < threshold_shares:
+                        passed_chip_filter = False
+                else:
+                    chip_summary = f"近{lookback_days}日無外資進出"
+                    passed_chip_filter = False
+        else:
+            # 若無啟用濾網，簡單呈現當日籌碼供參考 (可選)
+            if df_chip_main is not None and not df_chip_main.empty:
+                 day_chip = df_chip_main[(df_chip_main['date'] == analysis_date_str) & (df_chip_main['stock_id'] == code_str)]
+                 if not day_chip.empty:
+                     foreign = day_chip[day_chip['name'].str.contains('外資')]['net_buy'].sum()
+                     chip_summary = f"外資當日: {foreign:+.0f}張"
+        
+        # 如果啟用籌碼濾網且未達標，直接回傳不符合，節省後續技術面運算時間
+        if params.get('c_use_filter', False) and not passed_chip_filter:
+            return {'sniper': None, 'day': None}
+        # ------------------------------------------------
+        
         idx = df.index.get_loc(pd.Timestamp(analysis_date_str))
         close = df['Close']; high = df['High']; low = df['Low']; volume = df['Volume']; op = df['Open']
         stock_name = info['short_name']; sector_name = get_detailed_sector(code, standard_group=info.get('group'), custom_db=custom_sector_db); result_sniper = None; result_day = None
         s_ma_trend = params['s_ma_trend']; s_use_year = params['s_use_year']; s_big_candle = params['s_big_candle']; s_min_vol = params['s_min_vol']
         ma_t = close.rolling(window=s_ma_trend).mean(); ma_y = close.rolling(window=240).mean(); ma10 = close.rolling(window=10).mean(); ma20 = close.rolling(window=20).mean(); ma60 = close.rolling(window=60).mean()
         vol_ma_setup = volume.rolling(window=params.get('s_vol_ma_days', 20)).mean()
+        
         if (volume.iloc[idx] >= s_min_vol) and (not s_use_year or not (pd.isna(ma_y.iloc[idx]) or close.iloc[idx] < ma_y.iloc[idx])) and (close.iloc[idx] > ma_t.iloc[idx] > ma_t.iloc[idx-1]) and (pd.notna(ma60.iloc[idx]) and close.iloc[idx] > ma10.iloc[idx] > ma20.iloc[idx] > ma60.iloc[idx]):
             is_setup = ((close.iloc[idx] - close.iloc[idx-1]) / close.iloc[idx-1] > s_big_candle and volume.iloc[idx] > vol_ma_setup.iloc[idx] * params.get('s_vol_ratio', 0.7) and close.iloc[idx] > op.iloc[idx])
             setup_found = False; s_high = 0; s_low = 0; s_close = 0; s_date = ""; setup_idx = -1; defense_price = 0
@@ -430,18 +484,19 @@ def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sect
                     if not dropped_below_high:
                         if (c_today - s_close) / s_close <= 0.10:
                             score, score_details = calc_sniper_score(c_today, prev_h, defense_price, s_high, s_low, s_close, setup_idx, idx, high, low, volume, op, market_score, pullback_depth)
-                            result_sniper = ("triggered", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "漲幅": f"{daily_pct:+.2f}%", "產業": sector_name, "狀態": "🚀 強勢突破", "訊號日": s_date, "突破價": f"{prev_h:.2f}", "防守價": f"{defense_price:.2f}", "風險距離": f"{'✅' if score_details.get('風險距離',0)<=5.0 else '⚠️'}{score_details.get('風險距離',0):.1f}%", "回測深度": f"{'🔒' if score_details.get('回測深度',0)<=38 else '📊'}{score_details.get('回測深度',0):.1f}%", "sort_pct": daily_pct, "_score": score, "_risk_pct": score_details.get('風險距離',0), "_setup_date": s_date, "_defense": defense_price, "_signal_high": s_high, "_signal_low": s_low}) if is_breakout else ("watching", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "漲幅": f"{daily_pct:+.2f}%", "產業": sector_name, "狀態": "💪 強勢整理", "訊號日": s_date, "防守": f"{defense_price:.2f}", "長紅高": f"{s_high:.2f}", "sort_pct": daily_pct, "_setup_date": s_date, "_defense": defense_price, "_signal_high": s_high, "_signal_low": s_low})
+                            result_sniper = ("triggered", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "漲幅": f"{daily_pct:+.2f}%", "產業": sector_name, "狀態": "🚀 強勢突破", "訊號日": s_date, "突破價": f"{prev_h:.2f}", "防守價": f"{defense_price:.2f}", "法人籌碼": chip_summary, "風險距離": f"{'✅' if score_details.get('風險距離',0)<=5.0 else '⚠️'}{score_details.get('風險距離',0):.1f}%", "回測深度": f"{'🔒' if score_details.get('回測深度',0)<=38 else '📊'}{score_details.get('回測深度',0):.1f}%", "sort_pct": daily_pct, "_score": score, "_risk_pct": score_details.get('風險距離',0), "_setup_date": s_date, "_defense": defense_price, "_signal_high": s_high, "_signal_low": s_low}) if is_breakout else ("watching", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "漲幅": f"{daily_pct:+.2f}%", "產業": sector_name, "狀態": "💪 強勢整理", "訊號日": s_date, "防守": f"{defense_price:.2f}", "法人籌碼": chip_summary, "長紅高": f"{s_high:.2f}", "sort_pct": daily_pct, "_setup_date": s_date, "_defense": defense_price, "_signal_high": s_high, "_signal_low": s_low})
                     else:
                         if (is_breakout and close.iloc[idx-1] <= (s_high * 1.02)) or is_gap_breakout:
                             score, score_details = calc_sniper_score(c_today, prev_h, defense_price, s_high, s_low, s_close, setup_idx, idx, high, low, volume, op, market_score, pullback_depth)
-                            result_sniper = ("triggered", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "漲幅": f"{daily_pct:+.2f}%", "產業": sector_name, "狀態": "🚀 N字跳空" if is_gap_breakout else "🎯 N字突破", "訊號日": s_date, "突破價": f"{prev_h:.2f}", "防守價": f"{defense_price:.2f}", "風險距離": f"{'✅' if score_details.get('風險距離',0)<=5.0 else '⚠️'}{score_details.get('風險距離',0):.1f}%", "回測深度": f"{'🔒' if score_details.get('回測深度',0)<=38 else '📊'}{score_details.get('回測深度',0):.1f}%", "sort_pct": daily_pct, "_score": score, "_risk_pct": score_details.get('風險距離',0), "_setup_date": s_date, "_defense": defense_price, "_signal_high": s_high, "_signal_low": s_low})
-                        else: result_sniper = ("watching", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "漲幅": f"{daily_pct:+.2f}%", "產業": sector_name, "狀態": "📉 回檔整理", "訊號日": s_date, "防守": f"{defense_price:.2f}", "長紅高": f"{s_high:.2f}", "sort_pct": daily_pct, "_setup_date": s_date, "_defense": defense_price, "_signal_high": s_high, "_signal_low": s_low})
+                            result_sniper = ("triggered", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "漲幅": f"{daily_pct:+.2f}%", "產業": sector_name, "狀態": "🚀 N字跳空" if is_gap_breakout else "🎯 N字突破", "訊號日": s_date, "突破價": f"{prev_h:.2f}", "防守價": f"{defense_price:.2f}", "法人籌碼": chip_summary, "風險距離": f"{'✅' if score_details.get('風險距離',0)<=5.0 else '⚠️'}{score_details.get('風險距離',0):.1f}%", "回測深度": f"{'🔒' if score_details.get('回測深度',0)<=38 else '📊'}{score_details.get('回測深度',0):.1f}%", "sort_pct": daily_pct, "_score": score, "_risk_pct": score_details.get('風險距離',0), "_setup_date": s_date, "_defense": defense_price, "_signal_high": s_high, "_signal_low": s_low})
+                        else: result_sniper = ("watching", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "漲幅": f"{daily_pct:+.2f}%", "產業": sector_name, "狀態": "📉 回檔整理", "訊號日": s_date, "防守": f"{defense_price:.2f}", "法人籌碼": chip_summary, "長紅高": f"{s_high:.2f}", "sort_pct": daily_pct, "_setup_date": s_date, "_defense": defense_price, "_signal_high": s_high, "_signal_low": s_low})
             elif is_setup:
-                result_sniper = ("new_setup", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "產業": sector_name, "狀態": "🔥 剛起漲", "漲幅": f"{daily_pct:+.2f}%", "sort_pct": daily_pct, "_setup_date": df.index[idx].strftime('%Y-%m-%d'), "_defense": defense_price, "_signal_high": high.iloc[idx], "_signal_low": low.iloc[idx]})
+                result_sniper = ("new_setup", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "產業": sector_name, "狀態": "🔥 剛起漲", "漲幅": f"{daily_pct:+.2f}%", "法人籌碼": chip_summary, "sort_pct": daily_pct, "_setup_date": df.index[idx].strftime('%Y-%m-%d'), "_defense": defense_price, "_signal_high": high.iloc[idx], "_signal_low": low.iloc[idx]})
         d_period = params['d_period']; d_threshold = params['d_threshold']; d_min_vol = params['d_min_vol']; d_min_pct = params['d_min_pct']
         d_close = close.iloc[idx]; d_open = op.iloc[idx]; d_high = high.iloc[idx]; d_volume = volume.iloc[idx]; d_prev_close = close.iloc[idx-1]
         if idx >= d_period and (d_close > d_open) and ((d_high - d_close) / d_close < 0.01) and (d_min_pct/100 < (pct_chg_val := (d_close - d_prev_close) / d_prev_close) < 0.095) and ((d_volume / 1000) > d_min_vol) and (d_close >= ((prev_period_high := high.iloc[idx-d_period : idx].max()) * (1 - (d_threshold / 100)))) and (d_high <= prev_period_high):
-            result_day = {"代號": code, "名稱": stock_name, "收盤": f"{d_close:.2f}", "產業": sector_name, "漲幅": f"{(pct_chg_val*100):.2f}%", "成交量": int(d_volume/1000), "前波高點": f"{prev_period_high:.2f}", "距離高點": f"{(d_close - prev_period_high) / prev_period_high * 100:+.2f}%", "狀態": "⚡ 蓄勢待發"}
+            result_day = {"代號": code, "名稱": stock_name, "收盤": f"{d_close:.2f}", "產業": sector_name, "漲幅": f"{(pct_chg_val*100):.2f}%", "成交量": int(d_volume/1000), "前波高點": f"{prev_period_high:.2f}", "法人籌碼": chip_summary, "距離高點": f"{(d_close - prev_period_high) / prev_period_high * 100:+.2f}%", "狀態": "⚡ 蓄勢待發"}
+        
         return {'sniper': result_sniper, 'day': result_day}
     except Exception as e: return f"執行錯誤: {e}"
 
@@ -453,7 +508,7 @@ def display_full_table(df):
 # ==========================================
 # 🖥️ 介面主程式
 # ==========================================
-st.sidebar.title("🔥 強勢股戰情室 V18")
+st.sidebar.title("🔥 強勢股戰情室 V18+")
 st.sidebar.caption("純永豐金 API 企業級 24H 連線版")
 if os.path.exists(PARQUET_PATH): st.sidebar.success(f"📂 歷史資料：Parquet ({os.path.getsize(PARQUET_PATH) / 1024 / 1024:.1f} MB)")
 else: st.sidebar.warning("⚠️ 未找到 history.parquet")
@@ -466,6 +521,13 @@ status_text = st.sidebar.empty()
 progress_bar = st.sidebar.progress(0)
 st.sidebar.divider()
 
+# 👇 新增：籌碼過濾器 UI 區塊
+with st.sidebar.expander("🛡️ 法人籌碼濾網", expanded=True):
+    c_use_filter = st.checkbox("啟用籌碼過濾 (僅篩選外資買超)", value=False)
+    st.caption("啟用後，未達標股票將不會顯示在結果中")
+    c_lookback_days = st.number_input("最近 N 天", min_value=1, max_value=250, value=30)
+    c_threshold_shares = st.number_input("外資買超大於 (張)", min_value=0, max_value=1000000, value=10000, step=1000)
+
 with st.sidebar.expander("🟢 狙擊手策略參數 (波段)", expanded=False):
     s_ma_trend = st.number_input("趨勢線 (MA)", value=60); s_use_year = st.checkbox("啟用年線", value=True); s_big_candle = st.slider("長紅漲幅(%)", 2.0, 10.0, 5.0) / 100; s_min_vol = st.number_input("波段最小量(張)", value=1000) * 1000; s_setup_lookback = st.slider("回溯天數", 5, 30, 25); s_vol_ma_days = st.slider("量能MA", 5, 20, 20); s_vol_ratio = st.slider("量能門檻", 0.5, 1.5, 0.7); s_pullback_max = st.slider("回測深度(%)", 20, 70, 50)
 with st.sidebar.expander("🐂 BULL_v7 滾雪球參數", expanded=False):
@@ -474,7 +536,8 @@ with st.sidebar.expander("⚡ 隔日沖雷達參數", expanded=False):
     d_period = st.slider("追蹤波段(N)", 10, 120, 60); d_threshold = st.slider("高點誤差(%)", 0.0, 5.0, 1.0); d_min_pct = st.slider("最低漲幅(%)", 3.0, 9.0, 5.0); d_min_vol = st.number_input("最小量(張)", value=1000, step=500)
 max_workers_input = st.sidebar.slider("運算效能(執行緒)", 1, 32, 16)
 
-params = {'s_ma_trend': s_ma_trend, 's_use_year': s_use_year, 's_big_candle': s_big_candle, 's_min_vol': s_min_vol, 's_setup_lookback': s_setup_lookback, 's_vol_ma_days': s_vol_ma_days, 's_vol_ratio': s_vol_ratio, 's_pullback_max': s_pullback_max, 'd_period': d_period, 'd_threshold': d_threshold, 'd_min_pct': d_min_pct, 'd_min_vol': d_min_vol}
+# 👇 加入籌碼參數
+params = {'c_use_filter': c_use_filter, 'c_lookback_days': c_lookback_days, 'c_threshold_shares': c_threshold_shares, 's_ma_trend': s_ma_trend, 's_use_year': s_use_year, 's_big_candle': s_big_candle, 's_min_vol': s_min_vol, 's_setup_lookback': s_setup_lookback, 's_vol_ma_days': s_vol_ma_days, 's_vol_ratio': s_vol_ratio, 's_pullback_max': s_pullback_max, 'd_period': d_period, 'd_threshold': d_threshold, 'd_min_pct': d_min_pct, 'd_min_vol': d_min_vol}
 bull_params = {**BULL_PARAMS, "boll_period": int(b_boll_period), "boll_std": float(b_boll_std), "squeeze_n": int(b_squeeze_n), "squeeze_lookback": int(b_squeeze_lb), "vol_ratio": float(b_vol_ratio), "sma_trend_days": int(b_sma_days), "min_vol_shares": int(b_min_vol), "addon_b_profit": float(b_addon_b_pct)}
 
 tab1, tab3, tab4, tab5, tab6 = st.tabs(["🟢 狙擊手波段", "🐂 BULL滾雪球", "⚡ 隔日沖雷達", "📊 個股診斷", "🔧 系統診斷"])
@@ -493,11 +556,16 @@ def params_changed(): return st.session_state['scan_params'] is not None and (st
 # 執行整合掃描
 # ==========================================
 if start_scan:
-    # 這裡快取的問題已解決，它會乖乖回傳 1900+ 筆
     stock_map = get_stock_info_map(api)
     status_text.text("📈 正在判斷大盤狀態...")
     market_status = fetch_market_status(analysis_date_str, api)
     st.session_state['market_status'] = market_status
+    
+    # 👇 載入籌碼庫
+    df_chip_main = None
+    if c_use_filter or True: # 即使沒開過濾，也載入供表格顯示參考
+        status_text.text("☁️ 正在載入 Hugging Face 籌碼資料...")
+        df_chip_main = load_cloud_chip_data(HF_CHIP_URL)
 
     sniper_triggered = []; sniper_setup = []; sniper_watching = []; day_candidates = []; failed_list = []
     status_text.text("📂 正在讀取歷史資料 (data/history.parquet)...")
@@ -520,7 +588,7 @@ if start_scan:
         status_text.text("⚡ 正在請求永豐金 Shioaji 報價快照...")
         realtime_map = fetch_realtime_batch(list(history_data_store.keys()), api, status_text=status_text)
 
-    status_text.text("🧠 正在進行大盤與波段策略運算...")
+    status_text.text("🧠 正在進行技術與籌碼綜合掃描...")
     progress_bar.progress(0)
     tasks_data = {}
     def safe_f(val, default=0.0):
@@ -545,25 +613,26 @@ if start_scan:
     total = len(tasks_data); done = 0
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers_input) as executor:
-        futures = {executor.submit(analyze_combined_strategy, code, stock_map[code], analysis_date_str, params, SECTOR_DB, df, market_status.get('score', 5)): code for code, df in tasks_data.items()}
+        # 👇 傳入 df_chip_main
+        futures = {executor.submit(analyze_combined_strategy, code, stock_map[code], analysis_date_str, params, SECTOR_DB, df, market_status.get('score', 5), df_chip_main): code for code, df in tasks_data.items()}
         for future in concurrent.futures.as_completed(futures):
             done += 1
-            if done % 50 == 0 or done == total: progress_bar.progress(done / max(total, 1)); status_text.text(f"波段策略運算中: {done}/{total}")
+            if done % 50 == 0 or done == total: progress_bar.progress(done / max(total, 1)); status_text.text(f"綜合掃描中: {done}/{total}")
             res = future.result()
             if isinstance(res, dict):
-                if res['sniper']:
+                if res.get('sniper'):
                     typ, data = res['sniper']
                     if typ == "triggered": sniper_triggered.append(data)
                     elif typ == "new_setup": sniper_setup.append(data)
                     elif typ == "watching": sniper_watching.append(data)
-                if res['day']: day_candidates.append(res['day'])
+                if res.get('day'): day_candidates.append(res['day'])
             else:
                 current_code = futures[future]
                 failed_list.append(f"{current_code}: {res}")
 
     st.session_state['scan_results'] = {'sniper_triggered': sniper_triggered, 'sniper_setup': sniper_setup, 'sniper_watching': sniper_watching, 'day_candidates': day_candidates, 'failed_list': failed_list}
     progress_bar.progress(1.0)
-    status_text.success("✅ 全域掃描（波段、隔日沖）已完成！")
+    status_text.success("✅ 全域掃描（含籌碼濾網）已完成！")
     st.session_state['scan_params'] = params.copy()
     st.session_state['scan_date'] = analysis_date_str
     
@@ -632,13 +701,29 @@ with tab4:
     if results and results.get('day_candidates'): display_full_table(pd.DataFrame(results['day_candidates']))
     else: st.info("請先執行全域掃描，或今日無訊號。")
 
+# 👇 修改：個股診斷圖表，加入法人買賣超柱狀圖
 def plot_diagnosis_chart(df, stock_input, analysis_date_str, params, sniper_info=None):
     df = df.copy(); df['MA_Trend'] = df['Close'].rolling(window=params['s_ma_trend']).mean(); df['MA20'] = df['Close'].rolling(window=20).mean(); df['MA240'] = df['Close'].rolling(window=240).mean(); plot_df = df.tail(250)
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3], subplot_titles=("K線", "成交量"))
+    
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.5, 0.2, 0.3], subplot_titles=("K線", "成交量", "外資每日買賣超(張)"))
+    
     fig.add_trace(go.Candlestick(x=plot_df.index, open=plot_df['Open'], high=plot_df['High'], low=plot_df['Low'], close=plot_df['Close'], name='K線', increasing_line_color='red', decreasing_line_color='green'), row=1, col=1)
     fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA_Trend'], line=dict(color='blue', width=1.5), name=f"{params['s_ma_trend']}MA"), row=1, col=1)
-    fig.add_trace(go.Bar(x=plot_df.index, y=plot_df['Volume'], name='成交量'), row=2, col=1)
-    fig.update_layout(xaxis_rangeslider_visible=False, height=650, template="plotly_dark"); return fig
+    fig.add_trace(go.Bar(x=plot_df.index, y=plot_df['Volume'], name='成交量', marker_color='gray'), row=2, col=1)
+    
+    # 畫出籌碼圖
+    try:
+        df_chip = load_cloud_chip_data(HF_CHIP_URL)
+        stock_chip = df_chip[(df_chip['stock_id'] == str(stock_input).strip()) & (df_chip['name'].str.contains('外資'))].copy()
+        if not stock_chip.empty:
+            stock_chip.index = pd.to_datetime(stock_chip['date'])
+            # 對齊K線日期
+            stock_chip = stock_chip.reindex(plot_df.index).fillna(0)
+            colors = ['red' if x >= 0 else 'green' for x in stock_chip['net_buy']]
+            fig.add_trace(go.Bar(x=plot_df.index, y=stock_chip['net_buy'], name='外資買賣超', marker_color=colors), row=3, col=1)
+    except: pass
+
+    fig.update_layout(xaxis_rangeslider_visible=False, height=800, template="plotly_dark"); return fig
 
 with tab5:
     st.header("📊 個股診斷")
@@ -662,10 +747,6 @@ with tab6:
     try:
         safe_map = get_stock_info_map(api)
         st.info(f"成功安全載入目標股票清單: **{len(safe_map)}** 支")
-        if len(safe_map) > 1000:
-            st.success("✅ 合約映射正常，已完全避開永豐金資料庫中的異常權證 (int 毒封包)！全域掃描將暢通無阻。")
-        else:
-            st.warning("⚠️ 載入數量偏少，請檢查左側是否顯示 history.parquet 存在。")
     except Exception as e:
         st.error(f"合約檢查異常: {e}")
 
@@ -683,11 +764,10 @@ with tab6:
             total_stocks = df_check["code"].nunique()
             file_size_mb = os.path.getsize(PARQUET_PATH) / 1024 / 1024
 
-            # 計算最近交易日（跳過週末）
             today_tw = _now_tw().date()
             check_day = today_tw - _dt.timedelta(days=1)
             for _ in range(7):
-                if check_day.weekday() < 5:  # 0=Mon, 4=Fri
+                if check_day.weekday() < 5: 
                     break
                 check_day -= _dt.timedelta(days=1)
             latest_trading_day = check_day
@@ -698,28 +778,6 @@ with tab6:
             col_a.metric("📅 Parquet 最新日期", parquet_last_str)
             col_b.metric("📅 預估最近交易日", str(latest_trading_day))
             col_c.metric("⏳ 落後天數", f"{days_lag} 天" if days_lag >= 0 else "超前0天")
-
             st.info(f"📦 檔案大小：{file_size_mb:.1f} MB　|　股票數量：{total_stocks} 支")
-
-            if days_lag <= 0:
-                st.success("✅ 歷史資料為最新狀態，可直接掃描！")
-            elif days_lag <= 3:
-                st.warning(f"⚠️ 資料落後 {days_lag} 天（可能含假日），建議確認是否需要補資料。")
-            else:
-                st.error(f"🚨 資料已落後 {days_lag} 天！請執行 fetch_history.py 或資料更新腳本補齊。")
-
-            # 顯示各股最新日期分佈（前幾名落後股）
-            with st.expander("🔍 各股最新資料日期統計"):
-                stock_latest = df_check.groupby("code")["date"].max().reset_index()
-                stock_latest.columns = ["代號", "最新日期"]
-                stock_latest["最新日期"] = stock_latest["最新日期"].dt.strftime("%Y-%m-%d")
-                stale = stock_latest[stock_latest["最新日期"] < parquet_last_str]
-                st.write(f"資料日期不是最新的股票數：{len(stale)} 支（共 {total_stocks} 支）")
-                if not stale.empty:
-                    st.dataframe(stale.sort_values("最新日期").head(50), hide_index=True, use_container_width=True)
-                else:
-                    st.success("✅ 所有股票資料日期一致！")
         except Exception as e:
-            st.error(f"❌ 資料新鮮度檢查失敗：{e}")
-
-
+            st.error(f"❌ 資料檢查失敗：{e}")
