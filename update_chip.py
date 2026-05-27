@@ -12,7 +12,7 @@ from huggingface_hub import HfApi
 # ==========================================
 # 🔐 系統參數與環境變數 (絕對不寫死 Token)
 # ==========================================
-HF_TOKEN = os.environ.get("HF_TOKEN")
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
 FINMIND_TOKEN = os.environ.get("FINMIND_TOKEN", "")
 
 # 你的 Hugging Face 資料庫設定
