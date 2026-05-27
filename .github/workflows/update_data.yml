@@ -6,8 +6,9 @@ name: 📊 每日更新台股歷史資料
 
 on:
   schedule:
-    - cron: "30 6 * * 1-5"   # 週一到週五 UTC 06:30（台灣時間 14:30）
-  workflow_dispatch:           # 允許手動觸發
+    # 調整為 UTC 07:13 (台灣時間 15:13)，且只在週一至週五 (1-5) 執行
+    - cron: '13 7 * * 1-5'
+  workflow_dispatch: # 保留手動觸發按鈕，方便除錯
 
 jobs:
   update:
