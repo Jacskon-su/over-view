@@ -1,5 +1,5 @@
 # ==========================================
-# 強勢股戰情室 V18 (精準除錯版) + ☁️ 雲端籌碼整合版
+# 強勢股戰情室 V18 (終極雙雲端版 ☁️☁️)
 # ==========================================
 import streamlit as st
 import os
@@ -77,6 +77,15 @@ def get_shioaji_api():
 api = get_shioaji_api()
 
 # ==========================================
+# ☁️ 雲端資料庫 URL 設定
+# ==========================================
+# 👇 法人籌碼資料庫 URL
+HF_CHIP_URL = "https://huggingface.co/datasets/4340P/institutional_investors_parquet_by_stock/resolve/main/all_institutional_investors_2020_2026.parquet"
+
+# 👇 歷史報價資料庫 URL (⚠️ 請把下方替換成你新開的 Repo 名稱)
+HF_HISTORY_URL = "https://huggingface.co/datasets/4340P/請填入你的新資料庫名稱/resolve/main/history.parquet"
+
+# ==========================================
 # 🧠 策略核心邏輯類別 (Backtesting)
 # ==========================================
 def SMA(array, n): return pd.Series(array).rolling(window=n).mean()
@@ -109,7 +118,7 @@ class SniperStrategy(Strategy):
                 self.defense_price = (self.data.Close[-2] if self.data.Low[-1] > self.data.High[-2] else self.data.Low[-1]) * (1 - self.defense_buffer)
 
 # ==========================================
-# 🛠️ 輔助函式與資料庫 (Shioaji 版)
+# 🛠️ 輔助函式與資料庫
 # ==========================================
 def get_detailed_sector(code, standard_group=None, custom_db=None):
     code_str = str(code).strip()
@@ -117,95 +126,77 @@ def get_detailed_sector(code, standard_group=None, custom_db=None):
     if standard_group and str(standard_group) not in ['nan', 'None', '', 'NaN']: return str(standard_group)
     return "其他"
 
-PARQUET_PATH = "data/history.parquet"
-
-# 👇 籌碼資料庫 URL
-HF_CHIP_URL = "https://huggingface.co/datasets/4340P/institutional_investors_parquet_by_stock/resolve/main/all_institutional_investors_2020_2026.parquet"
-
 @st.cache_data(ttl=3600*12, show_spinner=False)
 def load_cloud_chip_data(url):
-    """載入雲端法人籌碼資料 (中英雙語兼容版)"""
+    """載入雲端法人籌碼資料"""
     url = url.replace("/blob/main/", "/resolve/main/")
     temp_file = "temp_chip_data.parquet"
-    
     try:
         resp = requests.get(url, timeout=45) 
-        if resp.status_code != 200:
-            st.error(f"❌ 雲端下載失敗，HTTP 狀態碼: {resp.status_code}")
-            return pd.DataFrame()
-            
-        with open(temp_file, "wb") as f:
-            f.write(resp.content)
-            
+        if resp.status_code != 200: return pd.DataFrame()
+        with open(temp_file, "wb") as f: f.write(resp.content)
         df_chip = pd.read_parquet(temp_file)
-        
         if not df_chip.empty:
             df_chip.columns = [str(c).lower() for c in df_chip.columns]
-            
-            if not all(col in df_chip.columns for col in ['date', 'stock_id', 'name', 'buy', 'sell']):
-                st.error(f"⚠️ 欄位名稱錯誤！目前欄位：{df_chip.columns.tolist()}")
-                return df_chip
-                
+            if not all(col in df_chip.columns for col in ['date', 'stock_id', 'name', 'buy', 'sell']): return df_chip
             df_chip['stock_id'] = df_chip['stock_id'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
             df_chip['name'] = df_chip['name'].astype(str).str.strip()
-            
-            # 搜尋 'Foreign_Investor' 或是 '外資'
             df_chip = df_chip[df_chip['name'].str.contains('Foreign_Investor|外資', case=False, na=False)].copy()
-            
             df_chip['date'] = pd.to_datetime(df_chip['date']).dt.strftime('%Y-%m-%d')
             df_chip['net_buy'] = ((df_chip['buy'] - df_chip['sell']) / 1000).astype('float32')
             df_chip = df_chip[['date', 'stock_id', 'net_buy']]
-            
         return df_chip
-        
+    except: return pd.DataFrame()
+
+@st.cache_data(ttl=3600*12, show_spinner=False)
+def load_cloud_history_data(url):
+    """載入雲端歷史報價資料"""
+    url = url.replace("/blob/main/", "/resolve/main/")
+    try:
+        df_all = pd.read_parquet(url)
+        df_all["date"] = pd.to_datetime(df_all["date"])
+        data_store = {}
+        for code, grp in df_all.groupby("code"):
+            grp = grp.sort_values("date").set_index("date")[["Open","High","Low","Close","Volume"]].copy()
+            grp.index.name = None
+            data_store[str(code).strip()] = grp 
+        last_date = df_all["date"].max().strftime("%Y-%m-%d")
+        return data_store, f"✅ 雲端歷史資料載入完成：{len(data_store)} 支 (最新至 {last_date})"
     except Exception as e:
-        st.error(f"❌ 讀取籌碼資料庫發生例外錯誤: {e}")
-        return pd.DataFrame()
+        return None, f"❌ 讀取雲端歷史資料庫失敗: {e}"
 
 def evaluate_chip_filter(code_str, analysis_date_str, df_kline, chip_params, df_chip_main):
-    """共用的籌碼過濾器函數"""
     chip_summary = "無籌碼資料"
     passed_chip_filter = True 
-    
     if chip_params.get('c_use_filter', True) and df_chip_main is not None and not df_chip_main.empty:
         target_date_ts = pd.Timestamp(analysis_date_str)
         lookback_days = chip_params.get('c_lookback_days', 30)
         threshold_shares = chip_params.get('c_threshold_shares', 10000)
-        
-        # 取得該檔股票過去 N 天的實際交易日
         valid_dates = df_kline[df_kline.index <= target_date_ts].tail(lookback_days).index.strftime('%Y-%m-%d').tolist()
-        
         if valid_dates:
             mask = (df_chip_main['stock_id'] == code_str) & (df_chip_main['date'].isin(valid_dates))
             recent_foreign_chip = df_chip_main[mask]
-            
             if not recent_foreign_chip.empty:
                 total_foreign_buy = recent_foreign_chip['net_buy'].sum()
                 chip_summary = f"近{lookback_days}日外資: {total_foreign_buy:+.0f}張"
-                if total_foreign_buy < threshold_shares:
-                    passed_chip_filter = False
+                if total_foreign_buy < threshold_shares: passed_chip_filter = False
             else:
                 chip_summary = f"近{lookback_days}日無外資進出"
                 passed_chip_filter = False
     else:
-        # 如果沒開過濾器，僅抓取當日資訊供參考
         if df_chip_main is not None and not df_chip_main.empty:
              day_chip = df_chip_main[(df_chip_main['date'] == analysis_date_str) & (df_chip_main['stock_id'] == code_str)]
-             if not day_chip.empty:
-                 foreign = day_chip['net_buy'].sum()
-                 chip_summary = f"外資當日: {foreign:+.0f}張"
-                 
+             if not day_chip.empty: chip_summary = f"外資當日: {day_chip['net_buy'].sum():+.0f}張"
     return passed_chip_filter, chip_summary
 
 @st.cache_data(ttl=3600*12)
 def get_stock_info_map(_api_instance):
     stock_map = {}
     valid_codes = set()
-    if os.path.exists(PARQUET_PATH):
-        try:
-            df = pd.read_parquet(PARQUET_PATH, columns=["code"])
-            valid_codes.update(df["code"].astype(str).unique())
-        except: pass
+    try:
+        df = pd.read_parquet(HF_HISTORY_URL, columns=["code"])
+        valid_codes.update(df["code"].astype(str).unique())
+    except: pass
     if len(valid_codes) < 1000:
         valid_codes.update([str(i).zfill(4) for i in range(1101, 10000)])
         valid_codes.update([f"00{str(i).zfill(3)}" for i in range(1, 1000)])
@@ -246,7 +237,7 @@ def get_stock_data_with_realtime(code, symbol, analysis_date_str, _api_instance)
     return df
 
 # ==========================================
-# 🐂 BULL_v7 模組 (已整合籌碼過濾)
+# 🐂 BULL_v7 模組
 # ==========================================
 BULL_SHEET_COLS = ["symbol","name","進場日期","進場價","上次加碼價","持倉最高價","加碼次數","加碼紀錄"]
 BULL_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -287,20 +278,17 @@ def bull_calc_indicators(df, params):
 def bull_scan_one(code, info, df_raw, params, pos_map, scan_date_ts, df_chip_main, chip_params):
     res = {"entry": None, "addon_a": None, "addon_b": None, "exit": None, "high_update": None}
     try:
-        # 🛡️ BULL 策略籌碼檢查
         passed_chip, chip_summary = evaluate_chip_filter(str(code).strip(), scan_date_ts.strftime('%Y-%m-%d'), df_raw, chip_params, df_chip_main)
-        
         df = bull_calc_indicators(df_raw, params); df = df[df.index <= scan_date_ts]
         if len(df) < 50: return res
         sym = info["symbol"]; name = info["short_name"]; r = df.iloc[-1]; r1 = df.iloc[-2]
         c = float(r["Close"]); sma_i = float(r["SMA"]); lo_i = float(r["Lower"]); l_i = float(r["Low"]); vol_i = float(r["Volume"]); vheavy = float(r["Vol_Heavy"]) if not pd.isna(r["Vol_Heavy"]) else 0
         if sym not in pos_map:
-            if passed_chip: # 僅在通過籌碼過濾時產生進場訊號
+            if passed_chip:
                 if not (pd.isna(r["Squeeze_Recent"]) or pd.isna(r["Vol_MA20"])):
                     if bool(r["Squeeze_Recent"]) and bool(r["SMA_Up"]) and (c > float(r["Upper"])) and (vol_i > float(r["Vol_MA"]) * params["vol_ratio"]) and (float(r["Vol_MA20"]) > params["min_vol_shares"]):
                         res["entry"] = {"代號": code, "名稱": name, "symbol": sym, "收盤價": round(c, 2), "上軌": round(float(r["Upper"]), 2), "15MA": round(sma_i, 2), "成交量": int(vol_i), "5MA量": int(r["Vol_MA"]) if not pd.isna(r["Vol_MA"]) else 0, "法人籌碼": chip_summary}
         else:
-            # 現有持倉不受進場籌碼濾網限制，仍須判斷加碼與出場
             pos = pos_map[sym]; ep = float(pos["進場價"]); lap = float(pos["上次加碼價"]); pp = float(pos["持倉最高價"])
             if c > pp: res["high_update"] = (sym, round(c, 2))
             heavy_break = (c < sma_i) and (vol_i >= vheavy) and vheavy > 0
@@ -333,20 +321,6 @@ def bull_run_scan(stock_map, all_data, scan_date_str, bull_positions, bull_param
     if status_text: status_text.success(f"✅ 全部掃描完成｜進場 {len(res['entry'])} | 出場 {len(res['exit'])}")
     if progress_bar: progress_bar.empty()
     return res
-
-# ==========================================
-# 📂 歷史資料管理
-# ==========================================
-def load_history_parquet():
-    if not os.path.exists(PARQUET_PATH): return None, f"找不到 {PARQUET_PATH}"
-    try:
-        df_all = pd.read_parquet(PARQUET_PATH); df_all["date"] = pd.to_datetime(df_all["date"]); data_store = {}
-        for code, grp in df_all.groupby("code"):
-            grp = grp.sort_values("date").set_index("date")[["Open","High","Low","Close","Volume"]].copy(); grp.index.name = None
-            data_store[str(code).strip()] = grp 
-        last_date = df_all["date"].max().strftime("%Y-%m-%d")
-        return data_store, f"✅ 歷史資料載入完成：{len(data_store)} 支"
-    except Exception as e: return None, f"❌ 讀取 {PARQUET_PATH} 失敗：{e}"
 
 def fetch_data_batch(stock_map, period="300d", chunk_size=150):
     all_symbols = [info['symbol'] for info in stock_map.values()]
@@ -421,7 +395,7 @@ def fetch_realtime_batch(codes_list, _api_instance, status_text=None):
     return realtime_data
 
 # ==========================================
-# 📈 策略模組 + 籌碼與過濾
+# 📈 策略模組
 # ==========================================
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_market_status(analysis_date_str, _api_instance=None):
@@ -453,12 +427,8 @@ def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sect
         df = df.loc[~df.index.duplicated(keep='last')].copy()
         if pd.Timestamp(analysis_date_str) not in df.index: return f"無 {analysis_date_str} 交易資料"
         
-        # --- 🛡️ 籌碼濾網運算 ---
         passed_chip_filter, chip_summary = evaluate_chip_filter(code_str, analysis_date_str, df, params, df_chip_main)
-        
-        if params.get('c_use_filter', True) and not passed_chip_filter:
-            return {'sniper': None, 'day': None}
-        # ------------------------------------------------
+        if params.get('c_use_filter', True) and not passed_chip_filter: return {'sniper': None, 'day': None}
         
         idx = df.index.get_loc(pd.Timestamp(analysis_date_str))
         close = df['Close']; high = df['High']; low = df['Low']; volume = df['Volume']; op = df['Open']
@@ -511,9 +481,8 @@ def display_full_table(df):
 # ==========================================
 st.sidebar.title("🔥 強勢股戰情室 V18+")
 st.sidebar.caption("純永豐金 API 企業級 24H 連線版")
-if os.path.exists(PARQUET_PATH): st.sidebar.success(f"📂 歷史資料：Parquet ({os.path.getsize(PARQUET_PATH) / 1024 / 1024:.1f} MB)")
-else: st.sidebar.warning("⚠️ 未找到 history.parquet")
-st.sidebar.success("🟢 Shioaji 全時段連線中")
+st.sidebar.success("☁️ 歷史資料：Hugging Face 雲端連線中")
+st.sidebar.success("🟢 Shioaji 全時段即時報價中")
 
 analysis_date_input = st.sidebar.date_input("分析基準日", _now_tw().date())
 analysis_date_str = analysis_date_input.strftime('%Y-%m-%d')
@@ -522,7 +491,7 @@ status_text = st.sidebar.empty()
 progress_bar = st.sidebar.progress(0)
 st.sidebar.divider()
 
-# 👇 法人過濾預設改為收起 (expanded=False)
+# 👇 法人過濾
 with st.sidebar.expander("🛡️ 法人籌碼濾網", expanded=False):
     c_use_filter = st.checkbox("啟用籌碼過濾 (僅篩選外資買超)", value=True)
     st.caption("啟用後，未達標股票將不會顯示在結果中")
@@ -563,23 +532,25 @@ if start_scan:
     market_status = fetch_market_status(analysis_date_str, api)
     st.session_state['market_status'] = market_status
     
-    # 載入籌碼庫
+    # 載入籌碼庫 (Hugging Face)
     df_chip_main = None
     if c_use_filter or True: 
-        status_text.text("☁️ 正在載入 Hugging Face 籌碼資料...")
+        status_text.text("☁️ 正在載入雲端法人籌碼...")
         df_chip_main = load_cloud_chip_data(HF_CHIP_URL)
         if df_chip_main is not None and not df_chip_main.empty:
-            st.sidebar.caption(f"✅ 雲端籌碼庫已載入 (資料最新至: **{df_chip_main['date'].max()}**)")
+            st.sidebar.caption(f"✅ 籌碼庫載入完畢 (最新至: **{df_chip_main['date'].max()}**)")
 
     sniper_triggered = []; sniper_setup = []; sniper_watching = []; day_candidates = []; failed_list = []
-    status_text.text("📂 正在讀取歷史資料 (data/history.parquet)...")
-    history_data_store, load_msg = load_history_parquet()
+    
+    # 載入歷史報價資料庫 (Hugging Face)
+    status_text.text("☁️ 正在載入雲端歷史報價...")
+    history_data_store, load_msg = load_cloud_history_data(HF_HISTORY_URL)
 
     if history_data_store is None:
-        status_text.text("⚠️ Parquet 不存在，改用 yfinance 下載...")
+        status_text.text("⚠️ 雲端歷史報價載入失敗，改用 yfinance 即時下載 (會較慢)...")
         history_data_store = fetch_data_batch(stock_map)
     else:
-        status_text.text(load_msg)
+        st.sidebar.caption(load_msg)
         history_data_store = {str(k).strip(): v for k, v in history_data_store.items() if str(k).strip() in stock_map}
 
     st.session_state['all_data_cache'] = history_data_store
@@ -589,7 +560,7 @@ if start_scan:
     realtime_map = {}
     
     if analysis_date_str == today_str:
-        status_text.text("⚡ 正在請求永豐金 Shioaji 報價快照...")
+        status_text.text("⚡ 正在請求永豐金即時報價快照...")
         realtime_map = fetch_realtime_batch(list(history_data_store.keys()), api, status_text=status_text)
 
     status_text.text("🧠 正在進行技術與籌碼綜合掃描...")
@@ -752,39 +723,40 @@ with tab6:
         st.error(f"合約檢查異常: {e}")
 
     st.divider()
-    st.subheader("3. 歷史資料新鮮度檢查")
-    if not os.path.exists(PARQUET_PATH):
-        st.error(f"❌ 找不到 {PARQUET_PATH}，請先更新歷史資料庫。")
-    else:
-        try:
-            import datetime as _dt
-            df_check = pd.read_parquet(PARQUET_PATH, columns=["date", "code"])
-            df_check["date"] = pd.to_datetime(df_check["date"])
-            parquet_last_date = df_check["date"].max()
-            parquet_last_str = parquet_last_date.strftime("%Y-%m-%d")
-            total_stocks = df_check["code"].nunique()
-            file_size_mb = os.path.getsize(PARQUET_PATH) / 1024 / 1024
+    
+    # --- 👇 更新：雲端歷史報價庫檢測 ---
+    st.subheader("3. ☁️ 雲端歷史報價資料庫檢測")
+    if st.button("測試讀取雲端報價庫"):
+        with st.spinner("正在從 Hugging Face 下載歷史報價庫..."):
+            try:
+                # 為了加速測試，只抓日期跟代號
+                df_check = pd.read_parquet(HF_HISTORY_URL, columns=["date", "code"])
+                df_check["date"] = pd.to_datetime(df_check["date"])
+                parquet_last_date = df_check["date"].max()
+                parquet_last_str = parquet_last_date.strftime("%Y-%m-%d")
+                total_stocks = df_check["code"].nunique()
 
-            today_tw = _now_tw().date()
-            check_day = today_tw - _dt.timedelta(days=1)
-            for _ in range(7):
-                if check_day.weekday() < 5: 
-                    break
-                check_day -= _dt.timedelta(days=1)
-            latest_trading_day = check_day
+                today_tw = _now_tw().date()
+                check_day = today_tw - datetime.timedelta(days=1)
+                for _ in range(7):
+                    if check_day.weekday() < 5: break
+                    check_day -= datetime.timedelta(days=1)
+                latest_trading_day = check_day
 
-            days_lag = (latest_trading_day - parquet_last_date.date()).days
+                days_lag = (latest_trading_day - parquet_last_date.date()).days
 
-            col_a, col_b, col_c = st.columns(3)
-            col_a.metric("📅 Parquet 最新日期", parquet_last_str)
-            col_b.metric("📅 預估最近交易日", str(latest_trading_day))
-            col_c.metric("⏳ 落後天數", f"{days_lag} 天" if days_lag >= 0 else "超前0天")
-            st.info(f"📦 檔案大小：{file_size_mb:.1f} MB　|　股票數量：{total_stocks} 支")
-        except Exception as e:
-            st.error(f"❌ 資料檢查失敗：{e}")
+                st.success("✅ 成功連線 Hugging Face 歷史報價庫！")
+                col_a, col_b, col_c = st.columns(3)
+                col_a.metric("📅 庫內最新日期", parquet_last_str)
+                col_b.metric("📅 預估最近交易日", str(latest_trading_day))
+                col_c.metric("⏳ 落後天數", f"{days_lag} 天" if days_lag >= 0 else "超前0天")
+                st.info(f"📦 股票涵蓋數量：{total_stocks} 支")
+            except Exception as e:
+                st.error(f"❌ 雲端資料庫檢查失敗，請確認你的 URL 與 Hugging Face 權限：{e}")
 
     st.divider()
-    # --- 移至最下方的雲端籌碼檢測 ---
+    
+    # --- 雲端籌碼檢測 ---
     st.subheader("4. ☁️ 雲端籌碼資料庫檢測 (X 光機)")
     if st.button("測試讀取雲端籌碼資料"):
         with st.spinner("正在從 Hugging Face 下載並解析資料..."):
@@ -801,7 +773,6 @@ with tab6:
                 st.write("🔍 資料前 5 筆預覽：")
                 st.dataframe(test_df.head())
                 
-                # 測試特定股票是否能抓到
                 tsmc = test_df[test_df['stock_id'] == '2330']
                 if not tsmc.empty:
                     st.info(f"✅ 成功找到台積電 (2330) 籌碼，最新一筆：{tsmc['date'].max()} / 外資淨買超：{tsmc['net_buy'].iloc[-1]:.0f} 張")
