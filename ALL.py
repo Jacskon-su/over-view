@@ -437,6 +437,10 @@ def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sect
         ma_t = close.rolling(window=s_ma_trend).mean(); ma_y = close.rolling(window=240).mean(); ma10 = close.rolling(window=10).mean(); ma20 = close.rolling(window=20).mean(); ma60 = close.rolling(window=60).mean()
         vol_ma_setup = volume.rolling(window=params.get('s_vol_ma_days', 20)).mean()
         
+        c_today = close.iloc[idx]
+        v_today = volume.iloc[idx]
+        daily_pct = (c_today - close.iloc[idx-1]) / close.iloc[idx-1] * 100
+        
         if (volume.iloc[idx] >= s_min_vol) and (not s_use_year or not (pd.isna(ma_y.iloc[idx]) or close.iloc[idx] < ma_y.iloc[idx])) and (close.iloc[idx] > ma_t.iloc[idx] > ma_t.iloc[idx-1]) and (pd.notna(ma60.iloc[idx]) and close.iloc[idx] > ma10.iloc[idx] > ma20.iloc[idx] > ma60.iloc[idx]):
             is_setup = ((close.iloc[idx] - close.iloc[idx-1]) / close.iloc[idx-1] > s_big_candle and volume.iloc[idx] > vol_ma_setup.iloc[idx] * params.get('s_vol_ratio', 0.7) and close.iloc[idx] > op.iloc[idx])
             setup_found = False; s_high = 0; s_low = 0; s_close = 0; s_date = ""; setup_idx = -1; defense_price = 0
@@ -446,7 +450,7 @@ def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sect
                     setup_found = True; setup_idx = b_idx; s_low = low.iloc[b_idx]; s_high = high.iloc[b_idx]; s_close = close.iloc[b_idx]; s_date = df.index[b_idx].strftime('%Y-%m-%d')
                     defense_price = (close.iloc[b_idx-1] if close.iloc[b_idx-1] >= op.iloc[b_idx-1] else op.iloc[b_idx-1]) * 0.99 if s_low > high.iloc[b_idx-1] else s_low * 0.99
                     break
-            c_today = close.iloc[idx]; prev_h = high.iloc[idx-1]; daily_pct = (c_today - close.iloc[idx-1]) / close.iloc[idx-1] * 100
+            prev_h = high.iloc[idx-1]
             if setup_found:
                 is_broken = False; dropped_below_high = False
                 for k in range(setup_idx + 1, idx + 1):
