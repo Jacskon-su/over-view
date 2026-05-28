@@ -16,7 +16,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
 # 👇 請把這裡改成你新開的 Hugging Face 資料庫名稱！(例如 "4340P/tw_stock_history")
-HF_REPO = "4340P/請填入你的新資料庫名稱" 
+HF_REPO = "4340P/history" 
 FILE_NAME = "history.parquet"
 HF_URL = f"https://huggingface.co/datasets/{HF_REPO}/resolve/main/{FILE_NAME}"
 
