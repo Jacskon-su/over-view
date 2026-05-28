@@ -83,7 +83,7 @@ api = get_shioaji_api()
 HF_CHIP_URL = "https://huggingface.co/datasets/4340P/institutional_investors_parquet_by_stock/resolve/main/all_institutional_investors_2020_2026.parquet"
 
 # 👇 歷史報價資料庫 URL (⚠️ 請把下方替換成你新開的 Repo 名稱)
-HF_HISTORY_URL = "https://huggingface.co/datasets/4340P/請填入你的新資料庫名稱/resolve/main/history.parquet"
+HF_HISTORY_URL = "https://huggingface.co/datasets/4340P/history/resolve/main/history.parquet"
 
 # ==========================================
 # 🧠 策略核心邏輯類別 (Backtesting)
