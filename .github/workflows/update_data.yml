@@ -6,48 +6,31 @@ name: 📊 每日更新台股歷史資料
 
 on:
   schedule:
-    # 調整為 UTC 07:13 (台灣時間 15:13)，且只在週一至週五 (1-5) 執行
     - cron: '13 7 * * 1-5'
-  workflow_dispatch: # 保留手動觸發按鈕，方便除錯
+  workflow_dispatch: 
 
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60 
 
     steps:
-      # 1. 取得 Repo 程式碼
       - name: ⬇️ Checkout Repo
         uses: actions/checkout@v4
 
-      # 2. 設定 Python
       - name: 🐍 Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
 
-      # 3. 安裝套件
       - name: 📦 Install dependencies
         run: |
-          pip install yfinance pandas pyarrow shioaji
+          pip install yfinance pandas pyarrow shioaji requests huggingface_hub
 
-      # 4. 執行更新腳本
       - name: 🔄 Run update_data.py
         env:
           SJ_API_KEY: ${{ secrets.SJ_API_KEY }}
           SJ_SECRET_KEY: ${{ secrets.SJ_SECRET_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: python update_data.py
-
-      # 5. 若有資料變動，自動 commit + push 回 Repo
-      - name: 📤 Commit and push
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/
-          if git diff --staged --quiet; then
-            echo "✅ 無資料變動，跳過 commit"
-          else
-            git commit -m "📊 自動更新歷史資料 $(date '+%Y-%m-%d')"
-            git push
-          fi
