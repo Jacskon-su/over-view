@@ -1,5 +1,5 @@
 # update_data.py
-# 台股歷史資料每日自動更新 (Hugging Face 雲端版)
+# 台股歷史資料每日自動更新 (Hugging Face 雲端版 - 永久保留歷史資料)
 import yfinance as yf
 import pandas as pd
 import os
@@ -16,13 +16,13 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
 # 👇 請把這裡改成你新開的 Hugging Face 資料庫名稱！(例如 "4340P/tw_stock_history")
-HF_REPO = "4340P/history" 
+HF_REPO = "4340P/請填入你的新資料庫名稱" 
 FILE_NAME = "history.parquet"
 HF_URL = f"https://huggingface.co/datasets/{HF_REPO}/resolve/main/{FILE_NAME}"
 
-KEEP_DAYS   = 800
 CHUNK_SIZE  = 100
 SLEEP_SEC   = 2
+NEW_STOCK_DAYS = 800 # 當發現新上市的股票時，預設往前抓取幾天的歷史資料
 
 def get_stock_map():
     stock_map = {}
@@ -103,7 +103,7 @@ def build_frames(all_dfs, sym_to_code, stock_map):
 def main():
     today = datetime.today().strftime("%Y-%m-%d")
     print("=" * 56)
-    print("  台股歷史資料每日更新 (Hugging Face 雲端版)")
+    print("  台股歷史資料每日更新 (Hugging Face 雲端無刪除版)")
     print("  執行時間：" + datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     print("=" * 56)
 
@@ -122,7 +122,7 @@ def main():
     except Exception as e:
         print("   ⚠️ 無法從 HF 讀取舊資料。請確認你是否已經手動上傳了第一份 history.parquet！")
         print(f"   (錯誤細節: {e})")
-        exit(1) # 如果沒有基底檔案，安全起見先中斷
+        exit(1) 
 
     print("\n2. 取得股票清單...")
     stock_map   = get_stock_map()
@@ -135,9 +135,9 @@ def main():
 
     if new_codes:
         new_symbols = [stock_map[c]["symbol"] for c in new_codes]
-        cutoff_str  = (datetime.today() - timedelta(days=KEEP_DAYS)).strftime("%Y-%m-%d")
+        cutoff_str  = (datetime.today() - timedelta(days=NEW_STOCK_DAYS)).strftime("%Y-%m-%d")
         end_new     = (datetime.today() + timedelta(days=1)).strftime("%Y-%m-%d")
-        print("\n3. 補齊新股歷史（" + str(len(new_codes)) + " 支）...")
+        print(f"\n3. 補齊新股歷史（{len(new_codes)} 支，往前抓取 {NEW_STOCK_DAYS} 天）...")
         chunks_new = [new_symbols[i:i+CHUNK_SIZE] for i in range(0, len(new_symbols), CHUNK_SIZE)]
         for idx, batch in enumerate(chunks_new, 1):
             print("  [" + str(idx) + "/" + str(len(chunks_new)) + "] 下載新股...", end="  ")
@@ -170,11 +170,10 @@ def main():
     new_data["date"] = pd.to_datetime(new_data["date"])
     
     combined = pd.concat([existing, new_data], ignore_index=True)
+    
+    # 去除重複：如果今天抓了兩次，只保留最新的一筆，確保資料精準乾淨
     combined = combined.drop_duplicates(subset=["code","date"], keep="last")
     combined = combined.sort_values(["code","date"]).reset_index(drop=True)
-
-    cutoff   = pd.Timestamp.today() - pd.Timedelta(days=KEEP_DAYS)
-    combined = combined[combined["date"] >= cutoff].reset_index(drop=True)
 
     combined["Open"]   = combined["Open"].astype("float32")
     combined["High"]   = combined["High"].astype("float32")
