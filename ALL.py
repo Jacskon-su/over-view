@@ -171,7 +171,7 @@ def evaluate_chip_filter(code_str, analysis_date_str, df_kline, chip_params, df_
     if chip_params.get('c_use_filter', True) and df_chip_main is not None and not df_chip_main.empty:
         target_date_ts = pd.Timestamp(analysis_date_str)
         lookback_days = chip_params.get('c_lookback_days', 30)
-        threshold_shares = chip_params.get('c_threshold_shares', 5000)
+        threshold_shares = chip_params.get('c_threshold_shares', 10000)
         valid_dates = df_kline[df_kline.index <= target_date_ts].tail(lookback_days).index.strftime('%Y-%m-%d').tolist()
         if valid_dates:
             mask = (df_chip_main['stock_id'] == code_str) & (df_chip_main['date'].isin(valid_dates))
@@ -423,70 +423,115 @@ def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sect
         code_str = str(code).strip()
 
         df = pre_loaded_df.copy() if pre_loaded_df is not None else get_stock_data_with_realtime(code, info['symbol'], analysis_date_str, api)
-        if df is None or df.empty or len(df) < 200: return "資料長度不足 (<200天)"
+        # ⚠️ 為了計算 240MA，將資料長度要求提高到 250 天
+        if df is None or df.empty or len(df) < 250: return "資料長度不足 (<250天)"
         df = df.loc[~df.index.duplicated(keep='last')].copy()
         if pd.Timestamp(analysis_date_str) not in df.index: return f"無 {analysis_date_str} 交易資料"
         
         passed_chip_filter, chip_summary = evaluate_chip_filter(code_str, analysis_date_str, df, params, df_chip_main)
-        if params.get('c_use_filter', True) and not passed_chip_filter: return {'sniper': None, 'day': None}
+        if params.get('c_use_filter', True) and not passed_chip_filter: return {'sniper': None, 'day': None, 'dip': None}
         
         idx = df.index.get_loc(pd.Timestamp(analysis_date_str))
         close = df['Close']; high = df['High']; low = df['Low']; volume = df['Volume']; op = df['Open']
-        stock_name = info['short_name']; sector_name = get_detailed_sector(code, standard_group=info.get('group'), custom_db=custom_sector_db); result_sniper = None; result_day = None
-        s_ma_trend = params['s_ma_trend']; s_use_year = params['s_use_year']; s_big_candle = params['s_big_candle']; s_min_vol = params['s_min_vol']
-        ma_t = close.rolling(window=s_ma_trend).mean(); ma_y = close.rolling(window=240).mean(); ma10 = close.rolling(window=10).mean(); ma20 = close.rolling(window=20).mean(); ma60 = close.rolling(window=60).mean()
-        vol_ma_setup = volume.rolling(window=params.get('s_vol_ma_days', 20)).mean()
+        
+        stock_name = info['short_name']
+        sector_name = get_detailed_sector(code, standard_group=info.get('group'), custom_db=custom_sector_db)
+        result_sniper = None
+        result_day = None
         
         c_today = close.iloc[idx]
         v_today = volume.iloc[idx]
-        daily_pct = (c_today - close.iloc[idx-1]) / close.iloc[idx-1] * 100
+        yesterday_c = close.iloc[idx-1] if idx > 0 else c_today
+        daily_pct = (c_today - yesterday_c) / yesterday_c * 100
         
-        if (volume.iloc[idx] >= s_min_vol) and (not s_use_year or not (pd.isna(ma_y.iloc[idx]) or close.iloc[idx] < ma_y.iloc[idx])) and (close.iloc[idx] > ma_t.iloc[idx] > ma_t.iloc[idx-1]) and (pd.notna(ma60.iloc[idx]) and close.iloc[idx] > ma10.iloc[idx] > ma20.iloc[idx] > ma60.iloc[idx]):
-            is_setup = ((close.iloc[idx] - close.iloc[idx-1]) / close.iloc[idx-1] > s_big_candle and volume.iloc[idx] > vol_ma_setup.iloc[idx] * params.get('s_vol_ratio', 0.7) and close.iloc[idx] > op.iloc[idx])
-            setup_found = False; s_high = 0; s_low = 0; s_close = 0; s_date = ""; setup_idx = -1; defense_price = 0
-            for k in range(1, params.get('s_setup_lookback', 25) + 1):
-                if (b_idx := idx - k) < 1: break
-                if ((close.iloc[b_idx] - close.iloc[b_idx-1]) / close.iloc[b_idx-1] > s_big_candle and volume.iloc[b_idx] > vol_ma_setup.iloc[b_idx] * params.get('s_vol_ratio', 0.7) and close.iloc[b_idx] > op.iloc[b_idx]):
-                    setup_found = True; setup_idx = b_idx; s_low = low.iloc[b_idx]; s_high = high.iloc[b_idx]; s_close = close.iloc[b_idx]; s_date = df.index[b_idx].strftime('%Y-%m-%d')
-                    defense_price = (close.iloc[b_idx-1] if close.iloc[b_idx-1] >= op.iloc[b_idx-1] else op.iloc[b_idx-1]) * 0.99 if s_low > high.iloc[b_idx-1] else s_low * 0.99
-                    break
-            prev_h = high.iloc[idx-1]
-            if setup_found:
-                is_broken = False; dropped_below_high = False
-                for k in range(setup_idx + 1, idx + 1):
-                    if close.iloc[k] < defense_price: is_broken = True; break
-                    if close.iloc[k] < s_high: dropped_below_high = True
-                if not is_broken and (pullback_depth := (s_close - (close.iloc[setup_idx + 1 : idx].min() if setup_idx + 1 < idx else s_close)) / s_close * 100) <= params.get('s_pullback_max', 50):
-                    is_breakout = c_today > prev_h; is_gap_breakout = (op.iloc[idx] > high.iloc[idx-1]) and (close.iloc[idx] > op.iloc[idx])
-                    if not dropped_below_high:
-                        if (c_today - s_close) / s_close <= 0.10:
-                            result_sniper = ("triggered", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "漲幅": f"{daily_pct:+.2f}%", "產業": sector_name, "狀態": "🚀 強勢突破", "訊號日": s_date, "突破價": f"{prev_h:.2f}", "防守價": f"{defense_price:.2f}", "法人籌碼": chip_summary, "sort_pct": daily_pct, "_setup_date": s_date, "_defense": defense_price, "_signal_high": s_high, "_signal_low": s_low}) if is_breakout else ("watching", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "漲幅": f"{daily_pct:+.2f}%", "產業": sector_name, "狀態": "💪 強勢整理", "訊號日": s_date, "防守": f"{defense_price:.2f}", "法人籌碼": chip_summary, "長紅高": f"{s_high:.2f}", "sort_pct": daily_pct, "_setup_date": s_date, "_defense": defense_price, "_signal_high": s_high, "_signal_low": s_low})
-                    else:
-                        if (is_breakout and close.iloc[idx-1] <= (s_high * 1.02)) or is_gap_breakout:
-                            result_sniper = ("triggered", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "漲幅": f"{daily_pct:+.2f}%", "產業": sector_name, "狀態": "🚀 N字跳空" if is_gap_breakout else "🎯 N字突破", "訊號日": s_date, "突破價": f"{prev_h:.2f}", "防守價": f"{defense_price:.2f}", "法人籌碼": chip_summary, "sort_pct": daily_pct, "_setup_date": s_date, "_defense": defense_price, "_signal_high": s_high, "_signal_low": s_low})
-                        else: result_sniper = ("watching", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "漲幅": f"{daily_pct:+.2f}%", "產業": sector_name, "狀態": "📉 回檔整理", "訊號日": s_date, "防守": f"{defense_price:.2f}", "法人籌碼": chip_summary, "長紅高": f"{s_high:.2f}", "sort_pct": daily_pct, "_setup_date": s_date, "_defense": defense_price, "_signal_high": s_high, "_signal_low": s_low})
-            elif is_setup:
-                result_sniper = ("new_setup", {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "產業": sector_name, "狀態": "🔥 剛起漲", "漲幅": f"{daily_pct:+.2f}%", "法人籌碼": chip_summary, "sort_pct": daily_pct, "_setup_date": df.index[idx].strftime('%Y-%m-%d'), "_defense": defense_price, "_signal_high": high.iloc[idx], "_signal_low": low.iloc[idx]})
-        d_period = params['d_period']; d_threshold = params['d_threshold']; d_min_vol = params['d_min_vol']; d_min_pct = params['d_min_pct']
+        # ==================================
+        # 🎯 真・均線起漲狙擊手 (30日籌碼 + 破底防守版)
+        # ==================================
+        ma10 = close.rolling(window=10).mean()
+        ma20 = close.rolling(window=20).mean()
+        ma60 = close.rolling(window=60).mean()
+        ma240 = close.rolling(window=240).mean()
+        v_ma5 = volume.rolling(window=5).mean()
+        
+        # 🔥 取過去 30 天外資籌碼累積
+        chip_30d_sum = 0
+        if df_chip_main is not None and code_str in df_chip_main.columns:
+            chip_series = df_chip_main[code_str].reindex(df.index).fillna(0)
+            chip_30d_sum = chip_series.iloc[max(0, idx-29):idx+1].sum()
+        
+        # 1. 動能與長線籌碼 (百萬股量 + 外資30天5000張)
+        if v_today >= 1000000 and chip_30d_sum >= 5000:
+            ma20_is_rising = ma20.iloc[idx] >= ma20.iloc[idx-1] if idx > 0 else False
+            above_60ma = c_today > ma60.iloc[idx]
+            above_240ma = pd.notna(ma240.iloc[idx]) and (c_today > ma240.iloc[idx])
+            
+            # 2. 均線保護
+            if ma20_is_rising and above_60ma and above_240ma:
+                lowest_20d = low.iloc[max(0, idx-19):idx+1].min()
+                not_extended = c_today <= (lowest_20d * 1.15)
+                
+                # 3. 型態不追高
+                if not_extended:
+                    recent_high = high.iloc[max(0, idx-6):idx].max() if idx >= 6 else high.iloc[0:idx].max()
+                    recent_low = low.iloc[max(0, idx-6):idx].min() if idx >= 6 else low.iloc[0:idx].min()
+                    yesterday_ma20 = ma20.iloc[idx-1] if idx > 0 else 0
+                    
+                    near_ma20 = abs(yesterday_c - yesterday_ma20) / yesterday_ma20 < 0.05 if yesterday_ma20 else False
+                    tight_range = (recent_high - recent_low) / recent_low < 0.08 if recent_low else False
+                    
+                    # 4. 潛伏壓縮確認
+                    if near_ma20 and tight_range:
+                        price_surge = (c_today - yesterday_c) / yesterday_c >= 0.04
+                        vol_surge = v_today > (v_ma5.iloc[idx-1] * 2) if idx > 0 else False
+                        
+                        # 5. 點火發動
+                        if price_surge and vol_surge:
+                            # 🛡️ 算出停損點：過去 15 天整理平台的最低點，再往下讓 2% 緩衝
+                            recent_15d_low = low.iloc[max(0, idx-14):idx+1].min()
+                            calculated_stop = recent_15d_low * 0.98
+                            
+                            # 🩸 鐵血斷頭防護：極限不超過 -10%
+                            max_loss_price = c_today * 0.90 
+                            defense_price = max(calculated_stop, max_loss_price)
+                            
+                            # 回傳給 Streamlit 的格式 (元組)
+                            result_sniper = ("triggered", {
+                                "代號": code, 
+                                "名稱": stock_name, 
+                                "收盤": f"{c_today:.2f}", 
+                                "漲幅": f"{daily_pct:+.2f}%", 
+                                "產業": sector_name, 
+                                "狀態": "🎯 真狙擊(箱底防守)", 
+                                "外資30日": f"{int(chip_30d_sum)}張",
+                                "防守價(前低)": f"{defense_price:.2f}", 
+                                "法人籌碼": chip_summary, 
+                                "sort_pct": daily_pct
+                            })
+
+        # ==================================
+        # ⚡ Day Trade 蓄勢待發策略 (完全保留不動)
+        # ==================================
+        d_period = params.get('d_period', 20)
+        d_threshold = params.get('d_threshold', 2)
+        d_min_vol = params.get('d_min_vol', 1000)
+        d_min_pct = params.get('d_min_pct', 2)
+        
         d_close = close.iloc[idx]; d_open = op.iloc[idx]; d_high = high.iloc[idx]; d_volume = volume.iloc[idx]; d_prev_close = close.iloc[idx-1]
         if idx >= d_period and (d_close > d_open) and ((d_high - d_close) / d_close < 0.01) and (d_min_pct/100 < (pct_chg_val := (d_close - d_prev_close) / d_prev_close) < 0.095) and ((d_volume / 1000) > d_min_vol) and (d_close >= ((prev_period_high := high.iloc[idx-d_period : idx].max()) * (1 - (d_threshold / 100)))) and (d_high <= prev_period_high):
             result_day = {"代號": code, "名稱": stock_name, "收盤": f"{d_close:.2f}", "產業": sector_name, "漲幅": f"{(pct_chg_val*100):.2f}%", "成交量": int(d_volume/1000), "前波高點": f"{prev_period_high:.2f}", "法人籌碼": chip_summary, "距離高點": f"{(d_close - prev_period_high) / prev_period_high * 100:+.2f}%", "狀態": "⚡ 蓄勢待發"}
         
         # ==================================
-        # 🏆 創高拉回佈局策略 (Dip-Buyer)
+        # 🏆 創高拉回佈局策略 Dip-Buyer (完全保留不動)
         # ==================================
         result_dip = None
         high_250 = high.rolling(250).max()
         peak_60 = high.iloc[max(0, idx-60):idx+1].max()
-        
-        ma240 = close.rolling(window=240).mean()
         
         trend_pass = (pd.notna(ma240.iloc[idx]) and ma240.iloc[idx] > ma240.iloc[idx-5]) and (c_today > ma240.iloc[idx])
         high_pass = (peak_60 >= high_250.iloc[idx]) and pd.notna(peak_60)
         
         if trend_pass and high_pass:
             pullback_pct = (c_today - peak_60) / peak_60 if peak_60 > 0 else 0
-            # 使用 sidebar 參數
             db_p_min = params.get('db_p_min', -25) / 100
             db_p_max = params.get('db_p_max', -10) / 100
             pullback_pass = (db_p_min <= pullback_pct <= db_p_max)
@@ -500,7 +545,8 @@ def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sect
                 result_dip = {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "漲幅": f"{daily_pct:+.2f}%", "產業": sector_name, "狀態": "🏆 創高拉回止跌", "拉回幅度": f"{pullback_pct*100:.2f}%", "一年高點": f"{peak_60:.2f}", "法人籌碼": chip_summary}
 
         return {'sniper': result_sniper, 'day': result_day, 'dip': result_dip}
-    except Exception as e: return f"執行錯誤: {e}"
+    except Exception as e: 
+        return f"執行錯誤: {e}"
 
 def display_full_table(df):
     if df is not None and not df.empty:
@@ -527,7 +573,7 @@ with st.sidebar.expander("🛡️ 法人籌碼濾網", expanded=False):
     c_use_filter = st.checkbox("啟用籌碼過濾 (僅篩選外資買超)", value=True)
     st.caption("啟用後，未達標股票將不會顯示在結果中")
     c_lookback_days = st.number_input("最近 N 天", min_value=1, max_value=250, value=30)
-    c_threshold_shares = st.number_input("外資買超大於 (張)", min_value=0, max_value=1000000, value=10000, step=1000)
+    c_threshold_shares = st.number_input("外資買超大於 (張)", min_value=0, max_value=1000000, value=5000, step=1000)
 
 # 👇 創高拉回策略參數
 with st.sidebar.expander("🏆 創高拉回策略 (波段)", expanded=False):
