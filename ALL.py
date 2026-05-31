@@ -459,21 +459,31 @@ def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sect
             valid_dates = df.index[:idx+1].strftime('%Y-%m-%d').tolist()[-30:]
             mask = (df_chip_main['stock_id'] == code_str) & (df_chip_main['date'].isin(valid_dates))
             chip_30d_sum = df_chip_main.loc[mask, 'net_buy'].sum()
-        
+
+        # ── Debug 計數器（回傳用） ──
+        sniper_debug = {
+            'gate1_vol_chip': False, 'gate2_ma': False,
+            'gate3_not_extended': False, 'gate4_compress': False, 'gate5_fire': False,
+            'chip_30d': float(chip_30d_sum), 'vol_k': round(v_today / 1000),
+        }
+
         # 1. 動能與長線籌碼 (百萬股量 + 外資30天5000張)
         if v_today >= 1000000 and chip_30d_sum >= 5000:
+            sniper_debug['gate1_vol_chip'] = True
             ma20_is_rising = ma20.iloc[idx] >= ma20.iloc[idx-1] if idx > 0 else False
             above_60ma = c_today > ma60.iloc[idx]
             above_240ma = pd.notna(ma240.iloc[idx]) and (c_today > ma240.iloc[idx])
             
             # 2. 均線保護
             if ma20_is_rising and above_60ma and above_240ma:
+                sniper_debug['gate2_ma'] = True
                 # ✅ 與回測一致：最近20天低點「不含今天」
                 lowest_20d = low.iloc[max(0, idx-20):idx].min()
                 not_extended = c_today <= (lowest_20d * 1.15)
                 
                 # 3. 型態不追高
                 if not_extended:
+                    sniper_debug['gate3_not_extended'] = True
                     # ✅ 與回測一致：取 i-6 到 i-1 共5根（不含今天）
                     recent_high = high.iloc[max(0, idx-6):max(0, idx-1)].max() if idx >= 2 else high.iloc[0:idx].max()
                     recent_low = low.iloc[max(0, idx-6):max(0, idx-1)].min() if idx >= 2 else low.iloc[0:idx].min()
@@ -484,18 +494,19 @@ def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sect
                     
                     # 4. 潛伏壓縮確認
                     if near_ma20 and tight_range:
+                        sniper_debug['gate4_compress'] = True
                         price_surge = (c_today - yesterday_c) / yesterday_c >= 0.04
                         vol_surge = v_today > (v_ma5.iloc[idx-1] * 2) if idx > 0 else False
                         
                         # 5. 點火發動
                         if price_surge and vol_surge:
+                            sniper_debug['gate5_fire'] = True
                             # ✅ 與回測一致：15天低點「不含今天」
                             recent_15d_low = low.iloc[max(0, idx-15):idx].min()
                             calculated_stop = recent_15d_low * 0.98
                             max_loss_price = c_today * 0.90 
                             defense_price = max(calculated_stop, max_loss_price)
                             
-                            # 🔥 修正這裡！把狀態改回包含「強勢突破」，這樣 UI 表格才會顯示
                             result_sniper = ("triggered", {
                                 "代號": code, 
                                 "名稱": stock_name, 
@@ -545,7 +556,7 @@ def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sect
             if pullback_pass and vol_shrink and trigger_pass:
                 result_dip = {"代號": code, "名稱": stock_name, "收盤": f"{c_today:.2f}", "漲幅": f"{daily_pct:+.2f}%", "產業": sector_name, "狀態": "🏆 創高拉回止跌", "拉回幅度": f"{pullback_pct*100:.2f}%", "一年高點": f"{peak_60:.2f}", "法人籌碼": chip_summary}
 
-        return {'sniper': result_sniper, 'day': result_day, 'dip': result_dip}
+        return {'sniper': result_sniper, 'day': result_day, 'dip': result_dip, 'sniper_debug': sniper_debug}
     except Exception as e: 
         return f"執行錯誤: {e}"
 
@@ -582,8 +593,22 @@ with st.sidebar.expander("🏆 創高拉回策略 (波段)", expanded=False):
     db_p_min = st.slider("最大拉回幅度(%)", -40, -10, -25)
     db_p_max = st.slider("最小拉回幅度(%)", -30, -5, -10)
 
-with st.sidebar.expander("🟢 狙擊手策略參數 (波段)", expanded=False):
-    s_ma_trend = st.number_input("趨勢線 (MA)", value=60); s_use_year = st.checkbox("啟用年線", value=True); s_big_candle = st.slider("長紅漲幅(%)", 2.0, 10.0, 5.0) / 100; s_min_vol = st.number_input("波段最小量(張)", value=1000) * 1000; s_setup_lookback = st.slider("回溯天數", 5, 30, 25); s_vol_ma_days = st.slider("量能MA", 5, 20, 20); s_vol_ratio = st.slider("量能門檻", 0.5, 1.5, 0.7); s_pullback_max = st.slider("回測深度(%)", 20, 70, 50)
+with st.sidebar.expander("🟢 狙擊手策略參數 (真狙擊手)", expanded=False):
+    st.caption("📥 進場條件")
+    s_min_vol      = st.number_input("最小成交量 (張)", value=1000, step=100) * 1000
+    s_chip_days    = st.number_input("外資觀察天數", value=30, min_value=5, max_value=60)
+    s_chip_thresh  = st.number_input("外資累積門檻 (張)", value=5000, step=500)
+    s_price_surge  = st.slider("點火最小漲幅 (%)", 1.0, 8.0, 4.0) / 100
+    s_vol_mult     = st.slider("點火量能倍數 (×5MA)", 1.0, 4.0, 2.0)
+    s_tight_range  = st.slider("盤整震幅上限 (%)", 3.0, 15.0, 8.0) / 100
+    s_near_ma20    = st.slider("貼近月線容忍 (%)", 1.0, 10.0, 5.0) / 100
+    s_not_extended = st.slider("不追高上限 (×近20低)", 1.05, 1.30, 1.15)
+    st.caption("📤 出場條件")
+    s_hard_stop    = st.slider("鐵血斷頭 (%)", -15.0, -5.0, -10.0) / 100
+    s_tp_trigger   = st.slider("停利啟動獲利 (%)", 5.0, 25.0, 15.0) / 100
+    # 保留舊變數名稱相容性（不影響掃描邏輯）
+    s_ma_trend = 60; s_use_year = True; s_big_candle = 0.05
+    s_setup_lookback = 25; s_vol_ma_days = 20; s_vol_ratio = 0.7; s_pullback_max = 50
 with st.sidebar.expander("🐂 BULL_v7 滾雪球參數", expanded=False):
     b_boll_period = st.number_input("布林週期", value=15, key="b_bp"); b_boll_std = st.number_input("布林標準差", value=2.1, key="b_bs"); b_squeeze_n = st.number_input("壓縮天數", value=15, key="b_sn"); b_squeeze_lb = st.number_input("回溯", value=5, key="b_sl"); b_vol_ratio = st.number_input("爆量倍數", value=1.5, key="b_vr"); b_sma_days = st.number_input("趨勢天數", value=3, key="b_sd"); b_min_vol = st.number_input("均量門檻(張)", value=1000, key="b_mv") * 1000; b_addon_b_pct = st.number_input("加碼B(%)", value=10, key="b_ab") / 100
 with st.sidebar.expander("⚡ 隔日沖雷達參數", expanded=False):
@@ -625,6 +650,7 @@ if start_scan:
             st.sidebar.caption(f"✅ 籌碼庫載入完畢 (最新至: **{df_chip_main['date'].max()}**)")
 
     sniper_triggered = []; sniper_setup = []; sniper_watching = []; day_candidates = []; dip_candidates = []; failed_list = []
+    sniper_gate_counts = {'gate1_vol_chip': 0, 'gate2_ma': 0, 'gate3_not_extended': 0, 'gate4_compress': 0, 'gate5_fire': 0, 'total': 0}
     
     # 載入歷史報價資料庫 (Hugging Face)
     status_text.text("☁️ 正在載入雲端歷史報價...")
@@ -685,11 +711,16 @@ if start_scan:
                     elif typ == "watching": sniper_watching.append(data)
                 if res.get('day'): day_candidates.append(res['day'])
                 if res.get('dip'): dip_candidates.append(res['dip'])
+                if res.get('sniper_debug'):
+                    dbg = res['sniper_debug']
+                    sniper_gate_counts['total'] += 1
+                    for g in ['gate1_vol_chip','gate2_ma','gate3_not_extended','gate4_compress','gate5_fire']:
+                        if dbg.get(g): sniper_gate_counts[g] += 1
             else:
                 current_code = futures[future]
                 failed_list.append(f"{current_code}: {res}")
 
-    st.session_state['scan_results'] = {'sniper_triggered': sniper_triggered, 'sniper_setup': sniper_setup, 'sniper_watching': sniper_watching, 'day_candidates': day_candidates, 'dip_candidates': dip_candidates, 'failed_list': failed_list}
+    st.session_state['scan_results'] = {'sniper_triggered': sniper_triggered, 'sniper_setup': sniper_setup, 'sniper_watching': sniper_watching, 'day_candidates': day_candidates, 'dip_candidates': dip_candidates, 'failed_list': failed_list, 'sniper_gate_counts': sniper_gate_counts}
     progress_bar.progress(1.0)
     status_text.success("✅ 全域掃描（含籌碼濾網）已完成！")
     st.session_state['scan_params'] = params.copy()
@@ -717,7 +748,21 @@ with tab1:
         if trig_strong or trig_n:
             if trig_strong: st.markdown(f"#### 🚀 強勢突破 ({len(trig_strong)})"); display_full_table(pd.DataFrame(trig_strong).sort_values(by='sort_pct', ascending=False).drop(columns=[c for c in ['sort_pct', '_setup_date', '_defense', '_signal_high', '_signal_low'] if c in pd.DataFrame(trig_strong).columns]))
             if trig_n: st.markdown(f"#### 🎯 N字突破 ({len(trig_n)})"); display_full_table(pd.DataFrame(trig_n).sort_values(by='sort_pct', ascending=False).drop(columns=[c for c in ['sort_pct', '_setup_date', '_defense', '_signal_high', '_signal_low'] if c in pd.DataFrame(trig_n).columns]))
+        else:
+            st.info("🔍 今日無符合真狙擊手條件的個股，明日繼續等待機會。")
     else: st.info("👈 請點擊左側「開始全域掃描」")
+
+    # 🔍 狙擊手條件漏斗 Debug（掃描後顯示）
+    if results and results.get('sniper_gate_counts'):
+        gc = results['sniper_gate_counts']
+        with st.expander("🔍 狙擊手條件漏斗（Debug）", expanded=True):
+            st.caption(f"掃描股票總數（有籌碼資料）: **{gc['total']}**")
+            cols = st.columns(5)
+            cols[0].metric("① 量+外資30日≥5000", gc['gate1_vol_chip'], help="成交量≥100萬股 且 外資30天累積≥5000張")
+            cols[1].metric("② 均線保護", gc['gate2_ma'], help="MA20上彎 + 股價>60MA + 股價>240MA")
+            cols[2].metric("③ 不追高", gc['gate3_not_extended'], help="股價≤近20天低點×1.15")
+            cols[3].metric("④ 潛伏壓縮", gc['gate4_compress'], help="貼近月線(<5%) + 震幅<8%")
+            cols[4].metric("⑤ 點火發動", gc['gate5_fire'], help="漲幅≥4% + 量能>5日均量×2")
 
 with tab2:
     st.header("🏆 創高拉回佈局")
