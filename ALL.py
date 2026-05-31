@@ -453,11 +453,12 @@ def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sect
         ma240 = close.rolling(window=240).mean()
         v_ma5 = volume.rolling(window=5).mean()
         
-        # 🔥 取過去 30 天外資籌碼累積
+        # 🔥 取過去 30 天外資籌碼累積 (long format 查詢，與 evaluate_chip_filter 一致)
         chip_30d_sum = 0
-        if df_chip_main is not None and code_str in df_chip_main.columns:
-            chip_series = df_chip_main[code_str].reindex(df.index).fillna(0)
-            chip_30d_sum = chip_series.iloc[max(0, idx-29):idx+1].sum()
+        if df_chip_main is not None and not df_chip_main.empty and 'stock_id' in df_chip_main.columns:
+            valid_dates = df.index[:idx+1].strftime('%Y-%m-%d').tolist()[-30:]
+            mask = (df_chip_main['stock_id'] == code_str) & (df_chip_main['date'].isin(valid_dates))
+            chip_30d_sum = df_chip_main.loc[mask, 'net_buy'].sum()
         
         # 1. 動能與長線籌碼 (百萬股量 + 外資30天5000張)
         if v_today >= 1000000 and chip_30d_sum >= 5000:
