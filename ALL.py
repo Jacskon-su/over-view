@@ -171,7 +171,7 @@ def evaluate_chip_filter(code_str, analysis_date_str, df_kline, chip_params, df_
     if chip_params.get('c_use_filter', True) and df_chip_main is not None and not df_chip_main.empty:
         target_date_ts = pd.Timestamp(analysis_date_str)
         lookback_days = chip_params.get('c_lookback_days', 30)
-        threshold_shares = chip_params.get('c_threshold_shares', 10000)
+        threshold_shares = chip_params.get('c_threshold_shares', 5000)
         valid_dates = df_kline[df_kline.index <= target_date_ts].tail(lookback_days).index.strftime('%Y-%m-%d').tolist()
         if valid_dates:
             mask = (df_chip_main['stock_id'] == code_str) & (df_chip_main['date'].isin(valid_dates))
