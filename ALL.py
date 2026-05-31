@@ -486,22 +486,19 @@ def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sect
                         
                         # 5. 點火發動
                         if price_surge and vol_surge:
-                            # 🛡️ 算出停損點：過去 15 天整理平台的最低點，再往下讓 2% 緩衝
                             recent_15d_low = low.iloc[max(0, idx-14):idx+1].min()
                             calculated_stop = recent_15d_low * 0.98
-                            
-                            # 🩸 鐵血斷頭防護：極限不超過 -10%
                             max_loss_price = c_today * 0.90 
                             defense_price = max(calculated_stop, max_loss_price)
                             
-                            # 回傳給 Streamlit 的格式 (元組)
+                            # 🔥 修正這裡！把狀態改回包含「強勢突破」，這樣 UI 表格才會顯示
                             result_sniper = ("triggered", {
                                 "代號": code, 
                                 "名稱": stock_name, 
                                 "收盤": f"{c_today:.2f}", 
                                 "漲幅": f"{daily_pct:+.2f}%", 
                                 "產業": sector_name, 
-                                "狀態": "🎯 真狙擊(箱底防守)", 
+                                "狀態": "🚀 強勢突破 (真狙擊)", 
                                 "外資30日": f"{int(chip_30d_sum)}張",
                                 "防守價(前低)": f"{defense_price:.2f}", 
                                 "法人籌碼": chip_summary, 
