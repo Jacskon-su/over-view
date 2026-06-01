@@ -453,10 +453,19 @@ def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sect
         ma240 = close.rolling(window=240).mean()
         v_ma5 = volume.rolling(window=5).mean()
         
-        # 🔥 取過去 30 天外資籌碼累積 (long format 查詢，與 evaluate_chip_filter 一致)
+        # 🔥 取過去 N 天外資籌碼累積（接 sidebar 參數）
+        _chip_days = params.get('s_chip_days', 30)
+        _chip_thresh = params.get('s_chip_thresh', 5000)
+        _min_vol = params.get('s_min_vol', 1000000)
+        _not_extended_mult = params.get('s_not_extended', 1.15)
+        _near_ma20_tol = params.get('s_near_ma20', 0.05)
+        _tight_range_max = params.get('s_tight_range', 0.08)
+        _price_surge_min = params.get('s_price_surge', 0.04)
+        _vol_mult = params.get('s_vol_mult', 2.0)
+
         chip_30d_sum = 0
         if df_chip_main is not None and not df_chip_main.empty and 'stock_id' in df_chip_main.columns:
-            valid_dates = df.index[:idx+1].strftime('%Y-%m-%d').tolist()[-30:]
+            valid_dates = df.index[:idx+1].strftime('%Y-%m-%d').tolist()[-_chip_days:]
             mask = (df_chip_main['stock_id'] == code_str) & (df_chip_main['date'].isin(valid_dates))
             chip_30d_sum = df_chip_main.loc[mask, 'net_buy'].sum()
 
@@ -467,8 +476,8 @@ def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sect
             'chip_30d': float(chip_30d_sum), 'vol_k': round(v_today / 1000),
         }
 
-        # 1. 動能與長線籌碼 (百萬股量 + 外資30天5000張)
-        if v_today >= 1000000 and chip_30d_sum >= 5000:
+        # 1. 動能與長線籌碼
+        if v_today >= _min_vol and chip_30d_sum >= _chip_thresh:
             sniper_debug['gate1_vol_chip'] = True
             ma20_is_rising = ma20.iloc[idx] >= ma20.iloc[idx-1] if idx > 0 else False
             above_60ma = c_today > ma60.iloc[idx]
@@ -477,36 +486,47 @@ def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sect
             # 2. 均線保護
             if ma20_is_rising and above_60ma and above_240ma:
                 sniper_debug['gate2_ma'] = True
-                # ✅ 與回測一致：最近20天低點「不含今天」
                 lowest_20d = low.iloc[max(0, idx-20):idx].min()
-                not_extended = c_today <= (lowest_20d * 1.15)
+                not_extended = c_today <= (lowest_20d * _not_extended_mult)
                 
                 # 3. 型態不追高
                 if not_extended:
                     sniper_debug['gate3_not_extended'] = True
-                    # ✅ 與回測一致：取 i-6 到 i-1 共5根（不含今天）
                     recent_high = high.iloc[max(0, idx-6):max(0, idx-1)].max() if idx >= 2 else high.iloc[0:idx].max()
                     recent_low = low.iloc[max(0, idx-6):max(0, idx-1)].min() if idx >= 2 else low.iloc[0:idx].min()
                     yesterday_ma20 = ma20.iloc[idx-1] if idx > 0 else 0
                     
-                    near_ma20 = abs(yesterday_c - yesterday_ma20) / yesterday_ma20 < 0.05 if yesterday_ma20 else False
-                    tight_range = (recent_high - recent_low) / recent_low < 0.08 if recent_low else False
+                    near_ma20 = abs(yesterday_c - yesterday_ma20) / yesterday_ma20 < _near_ma20_tol if yesterday_ma20 else False
+                    tight_range = (recent_high - recent_low) / recent_low < _tight_range_max if recent_low else False
                     
-                    # 4. 潛伏壓縮確認
+                    # 4. 潛伏壓縮確認 → 不論有無點火都記錄
                     if near_ma20 and tight_range:
                         sniper_debug['gate4_compress'] = True
-                        price_surge = (c_today - yesterday_c) / yesterday_c >= 0.04
-                        vol_surge = v_today > (v_ma5.iloc[idx-1] * 2) if idx > 0 else False
+                        recent_15d_low = low.iloc[max(0, idx-15):idx].min()
+                        calculated_stop = recent_15d_low * 0.98
+                        max_loss_price = c_today * 0.90
+                        defense_price = max(calculated_stop, max_loss_price)
+
+                        # 潛伏中（尚未點火）→ 存入 compress 清單
+                        result_sniper = ("compress", {
+                            "代號": code,
+                            "名稱": stock_name,
+                            "收盤": f"{c_today:.2f}",
+                            "漲幅": f"{daily_pct:+.2f}%",
+                            "產業": sector_name,
+                            "狀態": "🟡 潛伏壓縮 等待點火",
+                            "外資{}日".format(_chip_days): f"{int(chip_30d_sum)}張",
+                            "防守價(前低)": f"{defense_price:.2f}",
+                            "法人籌碼": chip_summary,
+                            "sort_pct": daily_pct
+                        })
+
+                        price_surge = (c_today - yesterday_c) / yesterday_c >= _price_surge_min
+                        vol_surge = v_today > (v_ma5.iloc[idx-1] * _vol_mult) if idx > 0 else False
                         
-                        # 5. 點火發動
+                        # 5. 點火發動 → 覆蓋為 triggered
                         if price_surge and vol_surge:
                             sniper_debug['gate5_fire'] = True
-                            # ✅ 與回測一致：15天低點「不含今天」
-                            recent_15d_low = low.iloc[max(0, idx-15):idx].min()
-                            calculated_stop = recent_15d_low * 0.98
-                            max_loss_price = c_today * 0.90 
-                            defense_price = max(calculated_stop, max_loss_price)
-                            
                             result_sniper = ("triggered", {
                                 "代號": code, 
                                 "名稱": stock_name, 
@@ -514,7 +534,7 @@ def analyze_combined_strategy(code, info, analysis_date_str, params, custom_sect
                                 "漲幅": f"{daily_pct:+.2f}%", 
                                 "產業": sector_name, 
                                 "狀態": "🚀 強勢突破 (真狙擊)", 
-                                "外資30日": f"{int(chip_30d_sum)}張",
+                                "外資{}日".format(_chip_days): f"{int(chip_30d_sum)}張",
                                 "防守價(前低)": f"{defense_price:.2f}", 
                                 "法人籌碼": chip_summary, 
                                 "sort_pct": daily_pct
@@ -616,7 +636,7 @@ with st.sidebar.expander("⚡ 隔日沖雷達參數", expanded=False):
 max_workers_input = st.sidebar.slider("運算效能(執行緒)", 1, 32, 16)
 
 # 組合所有參數
-params = {'c_use_filter': c_use_filter, 'c_lookback_days': c_lookback_days, 'c_threshold_shares': c_threshold_shares, 's_ma_trend': s_ma_trend, 's_use_year': s_use_year, 's_big_candle': s_big_candle, 's_min_vol': s_min_vol, 's_setup_lookback': s_setup_lookback, 's_vol_ma_days': s_vol_ma_days, 's_vol_ratio': s_vol_ratio, 's_pullback_max': s_pullback_max, 'd_period': d_period, 'd_threshold': d_threshold, 'd_min_pct': d_min_pct, 'd_min_vol': d_min_vol, 'db_p_min': db_p_min, 'db_p_max': db_p_max}
+params = {'c_use_filter': c_use_filter, 'c_lookback_days': c_lookback_days, 'c_threshold_shares': c_threshold_shares, 's_ma_trend': s_ma_trend, 's_use_year': s_use_year, 's_big_candle': s_big_candle, 's_min_vol': s_min_vol, 's_setup_lookback': s_setup_lookback, 's_vol_ma_days': s_vol_ma_days, 's_vol_ratio': s_vol_ratio, 's_pullback_max': s_pullback_max, 'd_period': d_period, 'd_threshold': d_threshold, 'd_min_pct': d_min_pct, 'd_min_vol': d_min_vol, 'db_p_min': db_p_min, 'db_p_max': db_p_max, 's_chip_days': s_chip_days, 's_chip_thresh': s_chip_thresh, 's_price_surge': s_price_surge, 's_vol_mult': s_vol_mult, 's_tight_range': s_tight_range, 's_near_ma20': s_near_ma20, 's_not_extended': s_not_extended, 's_hard_stop': s_hard_stop, 's_tp_trigger': s_tp_trigger}
 bull_params = {**BULL_PARAMS, "boll_period": int(b_boll_period), "boll_std": float(b_boll_std), "squeeze_n": int(b_squeeze_n), "squeeze_lookback": int(b_squeeze_lb), "vol_ratio": float(b_vol_ratio), "sma_trend_days": int(b_sma_days), "min_vol_shares": int(b_min_vol), "addon_b_profit": float(b_addon_b_pct)}
 chip_params = {'c_use_filter': c_use_filter, 'c_lookback_days': c_lookback_days, 'c_threshold_shares': c_threshold_shares}
 
@@ -649,7 +669,7 @@ if start_scan:
         if df_chip_main is not None and not df_chip_main.empty:
             st.sidebar.caption(f"✅ 籌碼庫載入完畢 (最新至: **{df_chip_main['date'].max()}**)")
 
-    sniper_triggered = []; sniper_setup = []; sniper_watching = []; day_candidates = []; dip_candidates = []; failed_list = []
+    sniper_triggered = []; sniper_compress = []; sniper_setup = []; sniper_watching = []; day_candidates = []; dip_candidates = []; failed_list = []
     sniper_gate_counts = {'gate1_vol_chip': 0, 'gate2_ma': 0, 'gate3_not_extended': 0, 'gate4_compress': 0, 'gate5_fire': 0, 'total': 0}
     
     # 載入歷史報價資料庫 (Hugging Face)
@@ -707,6 +727,7 @@ if start_scan:
                 if res.get('sniper'):
                     typ, data = res['sniper']
                     if typ == "triggered": sniper_triggered.append(data)
+                    elif typ == "compress": sniper_compress.append(data)
                     elif typ == "new_setup": sniper_setup.append(data)
                     elif typ == "watching": sniper_watching.append(data)
                 if res.get('day'): day_candidates.append(res['day'])
@@ -720,7 +741,7 @@ if start_scan:
                 current_code = futures[future]
                 failed_list.append(f"{current_code}: {res}")
 
-    st.session_state['scan_results'] = {'sniper_triggered': sniper_triggered, 'sniper_setup': sniper_setup, 'sniper_watching': sniper_watching, 'day_candidates': day_candidates, 'dip_candidates': dip_candidates, 'failed_list': failed_list, 'sniper_gate_counts': sniper_gate_counts}
+    st.session_state['scan_results'] = {'sniper_triggered': sniper_triggered, 'sniper_compress': sniper_compress, 'sniper_setup': sniper_setup, 'sniper_watching': sniper_watching, 'day_candidates': day_candidates, 'dip_candidates': dip_candidates, 'failed_list': failed_list, 'sniper_gate_counts': sniper_gate_counts}
     progress_bar.progress(1.0)
     status_text.success("✅ 全域掃描（含籌碼濾網）已完成！")
     st.session_state['scan_params'] = params.copy()
@@ -744,12 +765,36 @@ with tab1:
     if results:
         if results.get('failed_list'):
             with st.expander(f"⚠️ 掃描失敗清單 ({len(results['failed_list'])})"): st.write(", ".join(results['failed_list']))
-        s_trig = results['sniper_triggered']; trig_strong = [x for x in s_trig if "強勢突破" in x['狀態']]; trig_n = [x for x in s_trig if "N字" in x['狀態']]
+        _drop_cols = ['sort_pct', '_setup_date', '_defense', '_signal_high', '_signal_low']
+
+        s_trig = results.get('sniper_triggered', [])
+        s_comp = results.get('sniper_compress', [])
+        trig_strong = [x for x in s_trig if "強勢突破" in x['狀態']]
+        trig_n      = [x for x in s_trig if "N字" in x['狀態']]
+
+        # ── 🚀 點火發動表格 ──
         if trig_strong or trig_n:
-            if trig_strong: st.markdown(f"#### 🚀 強勢突破 ({len(trig_strong)})"); display_full_table(pd.DataFrame(trig_strong).sort_values(by='sort_pct', ascending=False).drop(columns=[c for c in ['sort_pct', '_setup_date', '_defense', '_signal_high', '_signal_low'] if c in pd.DataFrame(trig_strong).columns]))
-            if trig_n: st.markdown(f"#### 🎯 N字突破 ({len(trig_n)})"); display_full_table(pd.DataFrame(trig_n).sort_values(by='sort_pct', ascending=False).drop(columns=[c for c in ['sort_pct', '_setup_date', '_defense', '_signal_high', '_signal_low'] if c in pd.DataFrame(trig_n).columns]))
+            st.markdown("### 🚀 點火發動 — 今日進場訊號")
+            if trig_strong:
+                st.caption(f"強勢突破 {len(trig_strong)} 支")
+                df_ts = pd.DataFrame(trig_strong).sort_values(by='sort_pct', ascending=False)
+                display_full_table(df_ts.drop(columns=[c for c in _drop_cols if c in df_ts.columns]))
+            if trig_n:
+                st.caption(f"N字突破 {len(trig_n)} 支")
+                df_tn = pd.DataFrame(trig_n).sort_values(by='sort_pct', ascending=False)
+                display_full_table(df_tn.drop(columns=[c for c in _drop_cols if c in df_tn.columns]))
         else:
             st.info("🔍 今日無符合真狙擊手條件的個股，明日繼續等待機會。")
+
+        # ── 🟡 潛伏壓縮表格 ──
+        st.markdown("---")
+        st.markdown("### 🟡 潛伏壓縮 — 等待點火名單")
+        if s_comp:
+            st.caption(f"已通過①②③④關，尚未點火，共 {len(s_comp)} 支 — 明日持續追蹤")
+            df_sc = pd.DataFrame(s_comp).sort_values(by='sort_pct', ascending=False)
+            display_full_table(df_sc.drop(columns=[c for c in _drop_cols if c in df_sc.columns]))
+        else:
+            st.info("🟡 今日無潛伏壓縮個股。")
     else: st.info("👈 請點擊左側「開始全域掃描」")
 
     # 🔍 狙擊手條件漏斗 Debug（掃描後顯示）
